@@ -45,6 +45,7 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
             P1_EC => handlers::ec::handle_write_ec_key(apdu, store),
             P1_RSA => handlers::rsa::handle_write_rsa_key(apdu, store),
             P1_AES => handlers::aes::handle_write_aes_key(apdu, store),
+            P1_HMAC => handlers::aes::handle_write_hmac_key(apdu, store),
             P1_CRYPTO_OBJ => handlers::crypto_obj::handle_create(apdu, store),
             P1_CURVE => {
                 // CreateECCurve / SetECCurveParam: our crypto libs have curves built-in

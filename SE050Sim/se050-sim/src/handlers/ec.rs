@@ -433,7 +433,11 @@ pub fn handle_verify(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse
 /// Handle ECDH shared secret generation.
 /// INS=Crypto, P1=EC, P2=DH(0x0F)
 /// Tag1=privateKeyID(4B), Tag2=peerPublicKey, Tag7=sharedSecretOutputID(4B)
-/// The shared secret is stored as a binary object at sharedSecretOutputID.
+/// Per the SE05x IoT applet spec (7.2+, see Se05x_API_ECDHGenerateSharedSecret
+/// in the Plug & Trust middleware), the Tag7 target must reference an existing
+/// HMACKey object whose size equals the shared secret exactly; otherwise the
+/// applet returns SW_CONDITIONS_NOT_SATISFIED. The shared secret overwrites
+/// that object's value.
 pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
@@ -468,6 +472,13 @@ pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
         None => return ApduResponse::error(SW_FILE_NOT_FOUND),
     };
 
+    // The Tag7 target must already exist as an HMACKey object; the applet
+    // refuses to create it implicitly.
+    let target_len = match store.get(&output_id) {
+        Some(SecureObject::HMACKey { key }) => key.len(),
+        _ => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
     let shared_secret = match &key_obj {
         SecureObject::ECKeyPair { curve: ECCurve::NistP224, private_key, .. } => {
             p224_ecdh(private_key, peer_pubkey)
@@ -486,7 +497,10 @@ pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
 
     match shared_secret {
         Some(secret) => {
-            store.insert(output_id, SecureObject::Binary { data: secret.clone() });
+            if secret.len() != target_len {
+                return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+            }
+            store.insert(output_id, SecureObject::HMACKey { key: secret });
             ApduResponse::success()
         }
         None => ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
@@ -589,6 +603,86 @@ mod tests {
 
         let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
         assert!(p384_verify(&private_key, &hash, &tlvs[0].value));
+    }
+
+    fn tlv_bytes(tag: u8, value: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag, value.len() as u8];
+        v.extend_from_slice(value);
+        v
+    }
+
+    /// Build an ECDHGenerateSharedSecret_InObject APDU and a store holding a
+    /// P-256 key pair at 0x64. Returns (apdu, store, expected_secret).
+    fn ecdh_inobject_fixture() -> (ParsedApdu, ObjectStore, Vec<u8>) {
+        let sk = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let private_key = sk.to_bytes().to_vec();
+        let public_key = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+
+        let peer = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let peer_pub = peer.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+
+        let expected = p256_ecdh(&private_key, &peer_pub).unwrap();
+
+        let mut store = ObjectStore::new();
+        store.insert([0, 0, 0, 0x64], SecureObject::ECKeyPair {
+            curve: ECCurve::NistP256,
+            private_key,
+            public_key,
+        });
+
+        let mut data = tlv_bytes(TAG_1, &[0, 0, 0, 0x64]);
+        data.extend(tlv_bytes(TAG_2, &peer_pub));
+        data.extend(tlv_bytes(TAG_7, &[0, 0, 0, 0x66]));
+
+        let apdu = ParsedApdu {
+            cla: 0x80,
+            ins: 0x03,
+            p1: P1_EC,
+            p2: P2_DH,
+            data,
+            le: None,
+        };
+        (apdu, store, expected)
+    }
+
+    #[test]
+    fn test_ecdh_tag7_target_missing_returns_6985() {
+        // Applet 7.2 behavior: the Tag7 HMACKey object must be pre-created,
+        // otherwise SW_CONDITIONS_NOT_SATISFIED. This is the failure mode of
+        // wolfSSL's se050_ecc_shared_secret against middleware built for
+        // applet >= 07_02 (never creates the target object).
+        let (apdu, mut store, _) = ecdh_inobject_fixture();
+        let resp = handle_ecdh(&apdu, &mut store);
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert!(store.get(&[0, 0, 0, 0x66]).is_none());
+    }
+
+    #[test]
+    fn test_ecdh_tag7_wrong_size_target_returns_6985() {
+        let (apdu, mut store, _) = ecdh_inobject_fixture();
+        store.insert([0, 0, 0, 0x66], SecureObject::HMACKey { key: vec![0u8; 16] });
+        let resp = handle_ecdh(&apdu, &mut store);
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn test_ecdh_tag7_wrong_type_target_returns_6985() {
+        let (apdu, mut store, _) = ecdh_inobject_fixture();
+        store.insert([0, 0, 0, 0x66], SecureObject::Binary { data: vec![0u8; 32] });
+        let resp = handle_ecdh(&apdu, &mut store);
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn test_ecdh_tag7_precreated_hmackey_succeeds() {
+        let (apdu, mut store, expected) = ecdh_inobject_fixture();
+        store.insert([0, 0, 0, 0x66], SecureObject::HMACKey { key: vec![0u8; 32] });
+        let resp = handle_ecdh(&apdu, &mut store);
+        assert_eq!(resp.sw, 0x9000);
+        match store.get(&[0, 0, 0, 0x66]) {
+            Some(SecureObject::HMACKey { key }) => assert_eq!(key, &expected),
+            other => panic!("expected HMACKey with shared secret, got {:?}", other.is_some()),
+        }
     }
 }
 
