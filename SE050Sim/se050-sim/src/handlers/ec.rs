@@ -183,9 +183,11 @@ fn import_ec_key(
     _key_type: u8,
     store: &mut ObjectStore,
 ) -> ApduResponse {
-    // Ed25519 verify needs the stored public key (ed25519_dalek cannot derive
-    // a verifying key from a signature alone). Derive it at import time.
-    // ECC verify paths derive pub-from-priv on demand so they don't need this.
+    // Derive the public key from the private key at import time for every
+    // curve. Ed25519 verify needs it (ed25519_dalek cannot derive a verifying
+    // key from a signature alone), and ReadObject returns the public part of
+    // an asymmetric object, which hosts parse (e.g. wc_ecc_use_key_id reads
+    // the public key back after importing a private-only key).
     let public_key = match curve {
         ECCurve::Ed25519 if private_key_data.len() == 32 => {
             let mut priv_bytes = [0u8; 32];
@@ -194,6 +196,35 @@ fn import_ec_key(
                 .verifying_key()
                 .to_bytes()
                 .to_vec()
+        }
+        ECCurve::NistP224 if private_key_data.len() == 28 => {
+            match p224::ecdsa::SigningKey::from_bytes(private_key_data.into()) {
+                Ok(sk) => sk.verifying_key().to_encoded_point(false).as_bytes().to_vec(),
+                Err(_) => vec![],
+            }
+        }
+        ECCurve::NistP256 if private_key_data.len() == 32 => {
+            match p256::ecdsa::SigningKey::from_bytes(private_key_data.into()) {
+                Ok(sk) => sk.verifying_key().to_encoded_point(false).as_bytes().to_vec(),
+                Err(_) => vec![],
+            }
+        }
+        ECCurve::NistP384 if private_key_data.len() == 48 => {
+            match p384::ecdsa::SigningKey::from_bytes(private_key_data.into()) {
+                Ok(sk) => sk.verifying_key().to_encoded_point(false).as_bytes().to_vec(),
+                Err(_) => vec![],
+            }
+        }
+        ECCurve::Curve25519 if private_key_data.len() == 32 => {
+            // Stored reversed (BE) like generate_x25519_keypair: reverse the
+            // private key to LE, derive, store the public key reversed again.
+            let mut priv_bytes = [0u8; 32];
+            priv_bytes.copy_from_slice(private_key_data);
+            priv_bytes.reverse();
+            let secret = x25519_dalek::StaticSecret::from(priv_bytes);
+            let mut pub_bytes = x25519_dalek::PublicKey::from(&secret).to_bytes();
+            pub_bytes.reverse();
+            pub_bytes.to_vec()
         }
         _ => vec![],
     };
@@ -430,11 +461,27 @@ pub fn handle_verify(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse
     ApduResponse::success_with_tlvs(&[Tlv::new(TAG_1, &[result_byte])])
 }
 
+/// Whether the applet 7.2 strict ECDH InObject contract is enforced.
+/// Off by default so hosts that predate the contract keep working; set
+/// SE050_SIM_STRICT_ECDH=1 to enforce it.
+pub fn strict_ecdh_from_env() -> bool {
+    std::env::var("SE050_SIM_STRICT_ECDH").map(|v| v == "1").unwrap_or(false)
+}
+
 /// Handle ECDH shared secret generation.
 /// INS=Crypto, P1=EC, P2=DH(0x0F)
 /// Tag1=privateKeyID(4B), Tag2=peerPublicKey, Tag7=sharedSecretOutputID(4B)
-/// The shared secret is stored as a binary object at sharedSecretOutputID.
-pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
+/// Per the SE05x IoT applet spec (7.2+, see Se05x_API_ECDHGenerateSharedSecret
+/// in the Plug & Trust middleware), the Tag7 target must reference an existing
+/// HMACKey object whose size equals the shared secret exactly; otherwise the
+/// applet returns SW_CONDITIONS_NOT_SATISFIED. The shared secret overwrites
+/// that object's value.
+/// With `strict` false (the default, see strict_ecdh_from_env) a missing
+/// target instead falls back to the legacy simulator behavior of implicitly
+/// creating a Binary object, so hosts that predate the applet 7.2 contract
+/// keep working. A pre-existing HMACKey target gets the exact-size contract
+/// in both modes.
+pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore, strict: bool) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
         Err(_) => return ApduResponse::error(SW_WRONG_DATA),
@@ -468,6 +515,16 @@ pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
         None => return ApduResponse::error(SW_FILE_NOT_FOUND),
     };
 
+    // On the real applet the Tag7 target must already exist as an HMACKey
+    // object; the applet refuses to create it implicitly. In lenient mode a
+    // missing (or non-HMACKey) target keeps the legacy implicit-create
+    // behavior instead (target_len None).
+    let target_len = match store.get(&output_id) {
+        Some(SecureObject::HMACKey { key }) => Some(key.len()),
+        _ if strict => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
+        _ => None,
+    };
+
     let shared_secret = match &key_obj {
         SecureObject::ECKeyPair { curve: ECCurve::NistP224, private_key, .. } => {
             p224_ecdh(private_key, peer_pubkey)
@@ -486,7 +543,19 @@ pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
 
     match shared_secret {
         Some(secret) => {
-            store.insert(output_id, SecureObject::Binary { data: secret.clone() });
+            match target_len {
+                Some(len) => {
+                    if secret.len() != len {
+                        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+                    }
+                    store.insert(output_id, SecureObject::HMACKey { key: secret });
+                }
+                None => {
+                    // Legacy lenient behavior: implicitly create the target
+                    // as a Binary object.
+                    store.insert(output_id, SecureObject::Binary { data: secret });
+                }
+            }
             ApduResponse::success()
         }
         None => ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
@@ -589,6 +658,144 @@ mod tests {
 
         let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
         assert!(p384_verify(&private_key, &hash, &tlvs[0].value));
+    }
+
+    fn tlv_bytes(tag: u8, value: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag, value.len() as u8];
+        v.extend_from_slice(value);
+        v
+    }
+
+    /// Build an ECDHGenerateSharedSecret_InObject APDU and a store holding a
+    /// P-256 key pair at 0x64. Returns (apdu, store, expected_secret).
+    fn ecdh_inobject_fixture() -> (ParsedApdu, ObjectStore, Vec<u8>) {
+        let sk = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let private_key = sk.to_bytes().to_vec();
+        let public_key = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+
+        let peer = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let peer_pub = peer.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+
+        let expected = p256_ecdh(&private_key, &peer_pub).unwrap();
+
+        let mut store = ObjectStore::new();
+        store.insert([0, 0, 0, 0x64], SecureObject::ECKeyPair {
+            curve: ECCurve::NistP256,
+            private_key,
+            public_key,
+        });
+
+        let mut data = tlv_bytes(TAG_1, &[0, 0, 0, 0x64]);
+        data.extend(tlv_bytes(TAG_2, &peer_pub));
+        data.extend(tlv_bytes(TAG_7, &[0, 0, 0, 0x66]));
+
+        let apdu = ParsedApdu {
+            cla: 0x80,
+            ins: 0x03,
+            p1: P1_EC,
+            p2: P2_DH,
+            data,
+            le: None,
+        };
+        (apdu, store, expected)
+    }
+
+    #[test]
+    fn test_ecdh_strict_tag7_target_missing_returns_6985() {
+        // Applet 7.2 behavior: the Tag7 HMACKey object must be pre-created,
+        // otherwise SW_CONDITIONS_NOT_SATISFIED. This is the failure mode of
+        // wolfSSL's se050_ecc_shared_secret against middleware built for
+        // applet >= 07_02 (never creates the target object).
+        let (apdu, mut store, _) = ecdh_inobject_fixture();
+        let resp = handle_ecdh(&apdu, &mut store, true);
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert!(store.get(&[0, 0, 0, 0x66]).is_none());
+    }
+
+    #[test]
+    fn test_ecdh_strict_tag7_wrong_type_target_returns_6985() {
+        let (apdu, mut store, _) = ecdh_inobject_fixture();
+        store.insert([0, 0, 0, 0x66], SecureObject::Binary { data: vec![0u8; 32] });
+        let resp = handle_ecdh(&apdu, &mut store, true);
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn test_ecdh_tag7_wrong_size_hmackey_returns_6985_both_modes() {
+        // The exact-size contract applies whenever the target exists as an
+        // HMACKey, in strict and lenient mode alike.
+        for strict in [true, false] {
+            let (apdu, mut store, _) = ecdh_inobject_fixture();
+            store.insert([0, 0, 0, 0x66], SecureObject::HMACKey { key: vec![0u8; 16] });
+            let resp = handle_ecdh(&apdu, &mut store, strict);
+            assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED, "strict={}", strict);
+        }
+    }
+
+    #[test]
+    fn test_ecdh_tag7_precreated_hmackey_succeeds_both_modes() {
+        for strict in [true, false] {
+            let (apdu, mut store, expected) = ecdh_inobject_fixture();
+            store.insert([0, 0, 0, 0x66], SecureObject::HMACKey { key: vec![0u8; 32] });
+            let resp = handle_ecdh(&apdu, &mut store, strict);
+            assert_eq!(resp.sw, 0x9000, "strict={}", strict);
+            match store.get(&[0, 0, 0, 0x66]) {
+                Some(SecureObject::HMACKey { key }) => assert_eq!(key, &expected),
+                other => panic!("expected HMACKey with shared secret, got {:?}", other.is_some()),
+            }
+        }
+    }
+
+    #[test]
+    fn test_import_private_only_p256_derives_public() {
+        // wc_ecc_use_key_id imports a private-only key pair and then reads
+        // the public part back via ReadObject, so import must derive it.
+        let sk = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let expected_pub = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+
+        let mut store = ObjectStore::new();
+        let resp = import_ec_key([0, 0, 0, 0x32], ECCurve::NistP256,
+            &sk.to_bytes().to_vec(), P1_KEY_PAIR, &mut store);
+        assert_eq!(resp.sw, 0x9000);
+        match store.get(&[0, 0, 0, 0x32]) {
+            Some(SecureObject::ECKeyPair { public_key, .. }) => {
+                assert_eq!(public_key, &expected_pub);
+            }
+            other => panic!("expected ECKeyPair, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn test_import_private_only_x25519_derives_public() {
+        let secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let mut expected_pub = x25519_dalek::PublicKey::from(&secret).to_bytes();
+        expected_pub.reverse();
+        let mut priv_be = secret.to_bytes();
+        priv_be.reverse();
+
+        let mut store = ObjectStore::new();
+        let resp = import_ec_key([0, 0, 0, 0x33], ECCurve::Curve25519,
+            &priv_be, P1_KEY_PAIR, &mut store);
+        assert_eq!(resp.sw, 0x9000);
+        match store.get(&[0, 0, 0, 0x33]) {
+            Some(SecureObject::ECKeyPair { public_key, .. }) => {
+                assert_eq!(public_key, &expected_pub.to_vec());
+            }
+            other => panic!("expected ECKeyPair, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn test_ecdh_lenient_tag7_target_missing_creates_binary() {
+        // Legacy behavior for hosts that predate the applet 7.2 contract:
+        // a missing target is implicitly created as a Binary object.
+        let (apdu, mut store, expected) = ecdh_inobject_fixture();
+        let resp = handle_ecdh(&apdu, &mut store, false);
+        assert_eq!(resp.sw, 0x9000);
+        match store.get(&[0, 0, 0, 0x66]) {
+            Some(SecureObject::Binary { data }) => assert_eq!(data, &expected),
+            other => panic!("expected Binary with shared secret, got {:?}", other.is_some()),
+        }
     }
 }
 

@@ -45,6 +45,7 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
             P1_EC => handlers::ec::handle_write_ec_key(apdu, store),
             P1_RSA => handlers::rsa::handle_write_rsa_key(apdu, store),
             P1_AES => handlers::aes::handle_write_aes_key(apdu, store),
+            P1_HMAC => handlers::aes::handle_write_hmac_key(apdu, store),
             P1_CRYPTO_OBJ => handlers::crypto_obj::handle_create(apdu, store),
             P1_CURVE => {
                 // CreateECCurve / SetECCurveParam: our crypto libs have curves built-in
@@ -128,7 +129,8 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
             (P1_SIGNATURE, P2_VERIFY) => handlers::ec::handle_verify(apdu, store),
 
             // ECDH shared secret (P2_DH=0x0F or P2_DH_REVERSE=0x59)
-            (P1_EC, P2_DH) | (P1_EC, 0x59) => handlers::ec::handle_ecdh(apdu, store),
+            (P1_EC, P2_DH) | (P1_EC, 0x59) => handlers::ec::handle_ecdh(
+                apdu, store, handlers::ec::strict_ecdh_from_env()),
 
             // AES cipher oneshot
             (P1_CIPHER, P2_ENCRYPT_ONESHOT) => {

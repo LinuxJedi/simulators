@@ -81,6 +81,33 @@ pub fn handle_write_aes_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduR
     }
 }
 
+/// Handle WRITE HMAC key command (WriteSymmKey with P1=HMAC).
+/// Tag1=obj_id(4B), Tag3=key_data. HMAC keys have no fixed length, so any
+/// non-empty Tag3 value is accepted as-is.
+pub fn handle_write_hmac_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
+    let tlvs = match apdu.parse_tlvs() {
+        Ok(t) => t,
+        Err(_) => return ApduResponse::error(SW_WRONG_DATA),
+    };
+
+    let obj_id = match tlv::find_tlv(&tlvs, TAG_1) {
+        Some(t) if t.value.len() == 4 => {
+            let mut id = [0u8; 4];
+            id.copy_from_slice(&t.value);
+            id
+        }
+        _ => return ApduResponse::error(SW_WRONG_DATA),
+    };
+
+    match tlv::find_tlv(&tlvs, TAG_3) {
+        Some(t) if !t.value.is_empty() => {
+            store.insert(obj_id, SecureObject::HMACKey { key: t.value.clone() });
+            ApduResponse::success()
+        }
+        _ => ApduResponse::error(SW_WRONG_DATA),
+    }
+}
+
 /// Handle AES Encrypt Oneshot.
 /// INS=Crypto, P1=Cipher, P2=EncryptOneshot
 /// Tag1=key_id(4B), Tag2=cipher_mode(1B), Tag3=plaintext, Tag4=IV(opt)
@@ -384,4 +411,54 @@ where
     }
 
     Some(result)
+}
+
+#[cfg(test)]
+mod hmac_write_tests {
+    use super::*;
+    use crate::dispatch::dispatch;
+
+    #[test]
+    fn test_write_hmac_key_via_dispatch() {
+        // WriteSymmKey with P1=HMAC and the transient INS bit set
+        // (kSE05x_INS_WRITE | kSE05x_INS_TRANSIENT = 0x21), as sent by
+        // sss_key_store_set_key for a kSSS_CipherType_HMAC object.
+        let key = vec![0xA5u8; 32];
+        let mut data = vec![TAG_1, 0x04, 0x00, 0x00, 0x00, 0x66];
+        data.push(TAG_3);
+        data.push(key.len() as u8);
+        data.extend_from_slice(&key);
+
+        let apdu = ParsedApdu {
+            cla: 0x80,
+            ins: 0x21,
+            p1: P1_HMAC,
+            p2: P2_DEFAULT,
+            data,
+            le: None,
+        };
+        let mut store = ObjectStore::new();
+        let resp = dispatch(&apdu, &mut store);
+        assert_eq!(resp.sw, 0x9000);
+        match store.get(&[0x00, 0x00, 0x00, 0x66]) {
+            Some(SecureObject::HMACKey { key: stored }) => assert_eq!(stored, &key),
+            _ => panic!("HMACKey object not stored"),
+        }
+    }
+
+    #[test]
+    fn test_write_hmac_key_empty_value_rejected() {
+        let data = vec![TAG_1, 0x04, 0x00, 0x00, 0x00, 0x66, TAG_3, 0x00];
+        let apdu = ParsedApdu {
+            cla: 0x80,
+            ins: 0x01,
+            p1: P1_HMAC,
+            p2: P2_DEFAULT,
+            data,
+            le: None,
+        };
+        let mut store = ObjectStore::new();
+        let resp = dispatch(&apdu, &mut store);
+        assert_eq!(resp.sw, SW_WRONG_DATA);
+    }
 }

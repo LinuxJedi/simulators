@@ -109,6 +109,11 @@ RUN ln -sf /app/simw-top/build/sss/ex/src/libex_common.a \
 
 # ---- Pass-B: rebuild wolfSSL with --with-se050 ----
 # Links against the patched SDK we just built. Install overwrites Pass-A.
+# WOLFSSL_EXTRA_CFLAGS lets CI build variants (e.g.
+# -DWOLFSSL_SE050_ONLY_KEY_ID) without editing this file. It must reach both
+# the library build and the test.c/main.c compiles below, since the macro
+# gates test coverage in wolfcrypt/test/test.c as well.
+ARG WOLFSSL_EXTRA_CFLAGS=""
 WORKDIR /app/wolfssl
 RUN make clean 2>&1 && \
     ./configure \
@@ -125,7 +130,8 @@ RUN make clean 2>&1 && \
       --disable-examples \
       --enable-crypttests \
       CFLAGS="-DWOLFSSL_SE050_INIT -DWOLFSSL_SE050_NO_TRNG -DSIZEOF_LONG_LONG=8 \
-              -DECC_USER_CURVES -DHAVE_ECC224 -DHAVE_ECC256 -DHAVE_ECC384" \
+              -DECC_USER_CURVES -DHAVE_ECC224 -DHAVE_ECC256 -DHAVE_ECC384 \
+              ${WOLFSSL_EXTRA_CFLAGS}" \
       LDFLAGS="-L/app/simw-top/build" \
     2>&1 && \
     make -j$(nproc) 2>&1 && \
@@ -149,10 +155,10 @@ ENV SDK_INCS="-I/app/wolfssl \
     -I/app/simw-top/build"
 
 RUN gcc -c -o /tmp/test.o /app/wolfssl/wolfcrypt/test/test.c \
-    -DNO_MAIN_DRIVER -DHAVE_CONFIG_H $SDK_INCS 2>&1
+    -DNO_MAIN_DRIVER -DHAVE_CONFIG_H ${WOLFSSL_EXTRA_CFLAGS} $SDK_INCS 2>&1
 
 RUN gcc -c -o /tmp/main.o /app/wolfcrypt_test_main.c \
-    -DHAVE_CONFIG_H $SDK_INCS 2>&1
+    -DHAVE_CONFIG_H ${WOLFSSL_EXTRA_CFLAGS} $SDK_INCS 2>&1
 
 RUN gcc -o /app/wolfcrypt_se050_test /tmp/main.o /tmp/test.o \
     -L/usr/local/lib \

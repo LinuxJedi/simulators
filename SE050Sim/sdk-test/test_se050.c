@@ -332,6 +332,7 @@ static void test_ecdh(const char *name, uint32_t obj_a, uint32_t obj_b,
     uint8_t shared[64] = {0};
     size_t shared_len = sizeof(shared);
     size_t shared_bits = 0;
+    uint8_t dummy[64] = {0};
 
     /* Generate two key pairs */
     cleanup_object(obj_a);
@@ -357,7 +358,7 @@ static void test_ecdh(const char *name, uint32_t obj_a, uint32_t obj_b,
     /* Compute ECDH(A_priv, B_pub) */
     sss_key_object_init(&derived_key, &g_ks);
     status = sss_key_object_allocate_handle(&derived_key, obj_ss,
-        kSSS_KeyPart_Default, kSSS_CipherType_Binary, key_bytes,
+        kSSS_KeyPart_Default, kSSS_CipherType_HMAC, key_bytes,
         kKeyObject_Mode_Transient);
     ASSERT_OK(status, "derived allocate");
 
@@ -366,12 +367,20 @@ static void test_ecdh(const char *name, uint32_t obj_a, uint32_t obj_b,
     ASSERT_OK(status, "derive_key_context_init");
 
     sss_key_store_erase_key(&g_ks, &derived_key);
+    /* Applet 7.2+ stores the shared secret into a pre-existing HMACKey
+     * object whose size must equal the secret exactly; create it before
+     * the derive */
+    status = sss_key_store_set_key(&g_ks, &derived_key, dummy,
+        key_bytes, key_bytes * 8, NULL, 0);
+    ASSERT_OK(status, "derived pre-create");
     status = sss_derive_key_dh(&derive_ctx, &key_b, &derived_key);
     ASSERT_OK(status, "derive_key_dh");
 
     sss_derive_key_context_free(&derive_ctx);
 
-    /* Read shared secret */
+    /* Read shared secret. sss_key_store_get_key has no HMAC read case, so
+     * read the object back as AES type (both are a plain ReadObject). */
+    derived_key.cipherType = kSSS_CipherType_AES;
     status = sss_key_store_get_key(&g_ks, &derived_key,
         shared, &shared_len, &shared_bits);
     ASSERT_OK(status, "get shared secret");
@@ -1390,6 +1399,7 @@ static void test_x25519_ecdh(void)
     size_t shared_a_len = sizeof(shared_a), shared_b_len = sizeof(shared_b);
     size_t shared_bits = 0;
     uint8_t zeros[32] = {0};
+    uint8_t dummy[32] = {0};
 
     cleanup_object(id_a);
     cleanup_object(id_b);
@@ -1417,9 +1427,15 @@ static void test_x25519_ecdh(void)
     /* ECDH(A_priv, B_pub) */
     sss_key_object_init(&derived_a, &g_ks);
     status = sss_key_object_allocate_handle(&derived_a, id_ss_a,
-        kSSS_KeyPart_Default, kSSS_CipherType_Binary, 32,
+        kSSS_KeyPart_Default, kSSS_CipherType_HMAC, 32,
         kKeyObject_Mode_Transient);
     ASSERT_OK(status, "derived_a allocate");
+
+    /* Applet 7.2+: derive target must be a pre-existing HMACKey object
+     * sized exactly to the shared secret */
+    status = sss_key_store_set_key(&g_ks, &derived_a, dummy,
+        sizeof(dummy), sizeof(dummy) * 8, NULL, 0);
+    ASSERT_OK(status, "derived_a pre-create");
 
     status = sss_derive_key_context_init(&derive_ctx, &g_ctx.session,
         &key_a, kAlgorithm_SSS_ECDH, kMode_SSS_ComputeSharedSecret);
@@ -1428,6 +1444,7 @@ static void test_x25519_ecdh(void)
     ASSERT_OK(status, "derive_a dh");
     sss_derive_key_context_free(&derive_ctx);
 
+    derived_a.cipherType = kSSS_CipherType_AES;
     status = sss_key_store_get_key(&g_ks, &derived_a,
         shared_a, &shared_a_len, &shared_bits);
     ASSERT_OK(status, "get shared_a");
@@ -1435,9 +1452,13 @@ static void test_x25519_ecdh(void)
     /* ECDH(B_priv, A_pub) */
     sss_key_object_init(&derived_b, &g_ks);
     status = sss_key_object_allocate_handle(&derived_b, id_ss_b,
-        kSSS_KeyPart_Default, kSSS_CipherType_Binary, 32,
+        kSSS_KeyPart_Default, kSSS_CipherType_HMAC, 32,
         kKeyObject_Mode_Transient);
     ASSERT_OK(status, "derived_b allocate");
+
+    status = sss_key_store_set_key(&g_ks, &derived_b, dummy,
+        sizeof(dummy), sizeof(dummy) * 8, NULL, 0);
+    ASSERT_OK(status, "derived_b pre-create");
 
     status = sss_derive_key_context_init(&derive_ctx, &g_ctx.session,
         &key_b, kAlgorithm_SSS_ECDH, kMode_SSS_ComputeSharedSecret);
@@ -1446,6 +1467,7 @@ static void test_x25519_ecdh(void)
     ASSERT_OK(status, "derive_b dh");
     sss_derive_key_context_free(&derive_ctx);
 
+    derived_b.cipherType = kSSS_CipherType_AES;
     status = sss_key_store_get_key(&g_ks, &derived_b,
         shared_b, &shared_b_len, &shared_bits);
     ASSERT_OK(status, "get shared_b");
