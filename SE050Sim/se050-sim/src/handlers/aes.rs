@@ -101,8 +101,16 @@ pub fn handle_write_hmac_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> Apdu
         _ => return ApduResponse::error(SW_WRONG_DATA),
     };
 
-    let policy = tlv::find_tlv(&tlvs, TAG_POLICY)
-        .and_then(|t| crate::policy::ar_header_union(&t.value));
+    // A present but malformed (or empty) policy TLV is rejected up front,
+    // like the applet would, rather than being recorded as "no policy" and
+    // surfacing later as a strict-mode read denial.
+    let policy = match tlv::find_tlv(&tlvs, TAG_POLICY) {
+        Some(t) => match crate::policy::ar_header_union(&t.value) {
+            Some(header) => Some(header),
+            None => return ApduResponse::error(SW_WRONG_DATA),
+        },
+        None => None,
+    };
 
     match tlv::find_tlv(&tlvs, TAG_3) {
         Some(t) if !t.value.is_empty() => {
@@ -486,6 +494,31 @@ mod hmac_write_tests {
             }
             _ => panic!("HMACKey object not stored"),
         }
+    }
+
+    #[test]
+    fn test_write_hmac_key_malformed_policy_rejected() {
+        // A policy TLV that does not parse as an entry sequence must fail
+        // the write with SW_WRONG_DATA, not be recorded as "no policy".
+        let key = vec![0xA5u8; 32];
+        let mut data = vec![crate::tlv::TAG_POLICY, 0x03, 0xDE, 0xAD, 0xBE];
+        data.extend_from_slice(&[TAG_1, 0x04, 0x00, 0x00, 0x00, 0x68]);
+        data.push(TAG_3);
+        data.push(key.len() as u8);
+        data.extend_from_slice(&key);
+
+        let apdu = ParsedApdu {
+            cla: 0x80,
+            ins: 0x21,
+            p1: P1_HMAC,
+            p2: P2_DEFAULT,
+            data,
+            le: None,
+        };
+        let mut store = ObjectStore::new();
+        let resp = dispatch(&apdu, &mut store);
+        assert_eq!(resp.sw, SW_WRONG_DATA);
+        assert!(store.get(&[0x00, 0x00, 0x00, 0x68]).is_none());
     }
 
     #[test]
