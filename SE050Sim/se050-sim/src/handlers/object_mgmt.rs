@@ -34,9 +34,11 @@ pub fn handle_write(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse 
     }
 }
 
-/// Handle READ commands for objects. ReadObject enforces the symmetric
-/// key read policy (all real applet generations do, verified on SE050C
-/// applet 3.1.1 hardware); size/list/type reads are unaffected.
+/// Handle READ commands for objects. ReadObject enforces the read
+/// policy on HMACKey objects (all real applet generations do, verified
+/// on SE050C applet 3.1.1 hardware); size/list/type reads are
+/// unaffected. Real applets guard AESKey objects the same way, but the
+/// simulator does not model that yet.
 pub fn handle_read(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
     match apdu.p2 {
         P2_DEFAULT => handle_read_object(apdu, store),
@@ -241,14 +243,17 @@ fn handle_read_object(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespons
                 SecureObject::UserID { value } => value.clone(),
                 SecureObject::Counter { value } => value.to_be_bytes().to_vec(),
                 SecureObject::HMACKey { key, policy } => {
-                    // The applet refuses to export a symmetric key object
+                    // The applet refuses to export an HMACKey object
                     // unless the policy attached at creation grants
                     // POLICY_OBJ_ALLOW_READ; an object created with no
                     // policy attached is not readable. This holds on every
                     // real applet generation (observed on applet 3.1.1
                     // SE050C hardware and applet 7.2 parts alike), so it
                     // is enforced unconditionally, unlike the strict-mode
-                    // ECDH InObject target contract.
+                    // ECDH InObject target contract. Real applets guard
+                    // AESKey objects the same way; the simulator does not
+                    // model that yet since no tracked policy exists on
+                    // AESKey objects.
                     if policy.map_or(true,
                         |p| p & crate::policy::POLICY_OBJ_ALLOW_READ == 0)
                     {
@@ -430,6 +435,8 @@ mod read_policy_tests {
             SecureObject::Binary { data: data.clone() });
         let resp = handle_read(&read_apdu([0, 0, 0, 0x66]), &mut store);
         assert_eq!(resp.sw, 0x9000);
+        let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
+        assert_eq!(tlv::find_tlv(&tlvs, TAG_1).unwrap().value, data);
     }
 
     #[test]
