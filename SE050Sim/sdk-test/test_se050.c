@@ -58,6 +58,26 @@ static ex_sss_boot_ctx_t g_ctx;
 static sss_se05x_session_t *g_session;
 static sss_se05x_key_store_t g_ks;
 
+/* An HMACKey object created with no policy attached cannot be read back
+ * (the applet requires POLICY_OBJ_ALLOW_READ on symmetric key objects,
+ * on every applet generation), so the ECDH derive targets are created
+ * with a common policy granting read, write and delete. An attached
+ * policy replaces the applet default entirely, so write (the ECDH
+ * result) and delete (cleanup) must be granted explicitly as well. */
+static sss_policy_u g_derive_common_pol = {
+    .type = KPolicy_Common,
+    .auth_obj_id = 0,
+    .policy = { .common = {
+        .can_Read = 1,
+        .can_Write = 1,
+        .can_Delete = 1,
+    }},
+};
+static sss_policy_t g_derive_policy = {
+    .policies = { &g_derive_common_pol },
+    .nPolicies = 1,
+};
+
 /* Object ID base — use high range to avoid conflicts */
 #define OBJ_ID_BASE 0x10000000
 
@@ -371,7 +391,8 @@ static void test_ecdh(const char *name, uint32_t obj_a, uint32_t obj_b,
      * object whose size must equal the secret exactly; create it before
      * the derive */
     status = sss_key_store_set_key(&g_ks, &derived_key, dummy,
-        key_bytes, key_bytes * 8, NULL, 0);
+        key_bytes, key_bytes * 8, &g_derive_policy,
+        sizeof(g_derive_policy));
     ASSERT_OK(status, "derived pre-create");
     status = sss_derive_key_dh(&derive_ctx, &key_b, &derived_key);
     ASSERT_OK(status, "derive_key_dh");
@@ -1434,7 +1455,8 @@ static void test_x25519_ecdh(void)
     /* Applet 7.2+: derive target must be a pre-existing HMACKey object
      * sized exactly to the shared secret */
     status = sss_key_store_set_key(&g_ks, &derived_a, dummy,
-        sizeof(dummy), sizeof(dummy) * 8, NULL, 0);
+        sizeof(dummy), sizeof(dummy) * 8, &g_derive_policy,
+        sizeof(g_derive_policy));
     ASSERT_OK(status, "derived_a pre-create");
 
     status = sss_derive_key_context_init(&derive_ctx, &g_ctx.session,
@@ -1457,7 +1479,8 @@ static void test_x25519_ecdh(void)
     ASSERT_OK(status, "derived_b allocate");
 
     status = sss_key_store_set_key(&g_ks, &derived_b, dummy,
-        sizeof(dummy), sizeof(dummy) * 8, NULL, 0);
+        sizeof(dummy), sizeof(dummy) * 8, &g_derive_policy,
+        sizeof(g_derive_policy));
     ASSERT_OK(status, "derived_b pre-create");
 
     status = sss_derive_key_context_init(&derive_ctx, &g_ctx.session,
