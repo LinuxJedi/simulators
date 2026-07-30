@@ -110,6 +110,12 @@ pub enum SecureObject {
     },
     HMACKey {
         key: Vec<u8>,
+        /// Union of the AR headers from the TAG_POLICY TLV attached at
+        /// creation; None when the object was created with no policy.
+        /// The applet 7.2 read-policy contract keys off this (see
+        /// crate::policy).
+        #[serde(default)]
+        policy: Option<u32>,
     },
 }
 
@@ -166,7 +172,7 @@ impl SecureObject {
             SecureObject::Binary { data } => data.len(),
             SecureObject::UserID { value } => value.len(),
             SecureObject::Counter { .. } => 8,
-            SecureObject::HMACKey { key } => key.len(),
+            SecureObject::HMACKey { key, .. } => key.len(),
         }
     }
 }
