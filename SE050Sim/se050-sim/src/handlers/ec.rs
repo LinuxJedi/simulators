@@ -463,10 +463,10 @@ pub fn handle_verify(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse
 
 /// Whether the applet 7.2 strict ECDH InObject contract is enforced.
 /// Off by default so hosts that predate the contract keep working; set
-/// SE050_SIM_STRICT_ECDH=1 to enforce it. Strict mode also enforces the
-/// derive-target read policy: ReadObject on an HMACKey object is refused
-/// with SW_COMMAND_NOT_ALLOWED unless the policy attached at creation
-/// grants POLICY_OBJ_ALLOW_READ (see object_mgmt::handle_read).
+/// SE050_SIM_STRICT_ECDH=1 to enforce it. Note the symmetric key read
+/// policy is unrelated to this switch: ReadObject on an HMACKey object
+/// without POLICY_OBJ_ALLOW_READ is always refused, as every real
+/// applet generation does (see object_mgmt::handle_read).
 pub fn strict_ecdh_from_env() -> bool {
     std::env::var("SE050_SIM_STRICT_ECDH").map(|v| v == "1").unwrap_or(false)
 }
