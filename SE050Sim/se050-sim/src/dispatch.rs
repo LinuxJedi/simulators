@@ -120,7 +120,8 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
                 ApduResponse::success_with_tlvs(
                     &[crate::tlv::Tlv::new(crate::tlv::TAG_1, &curve_list)])
             }
-            _ => handlers::object_mgmt::handle_read(apdu, store),
+            _ => handlers::object_mgmt::handle_read(
+                apdu, store, handlers::ec::strict_ecdh_from_env()),
         },
 
         INS_CRYPTO => match (cred_type, apdu.p2) {

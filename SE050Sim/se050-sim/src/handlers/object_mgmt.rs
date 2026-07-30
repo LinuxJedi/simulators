@@ -34,10 +34,12 @@ pub fn handle_write(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse 
     }
 }
 
-/// Handle READ commands for objects.
-pub fn handle_read(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
+/// Handle READ commands for objects. With `strict` (the applet 7.2
+/// contract, see ec::strict_ecdh_from_env) ReadObject enforces the
+/// symmetric key read policy; size/list/type reads are unaffected.
+pub fn handle_read(apdu: &ParsedApdu, store: &mut ObjectStore, strict: bool) -> ApduResponse {
     match apdu.p2 {
-        P2_DEFAULT => handle_read_object(apdu, store),
+        P2_DEFAULT => handle_read_object(apdu, store, strict),
         P2_SIZE => handle_read_size(apdu, store),
         P2_LIST => handle_read_id_list(apdu, store),
         P2_TYPE => handle_read_type(apdu, store),
@@ -190,7 +192,7 @@ fn handle_write_counter(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespo
     ApduResponse::success()
 }
 
-fn handle_read_object(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
+fn handle_read_object(apdu: &ParsedApdu, store: &mut ObjectStore, strict: bool) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
         Err(_) => return ApduResponse::error(SW_WRONG_DATA),
@@ -238,7 +240,21 @@ fn handle_read_object(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespons
                 SecureObject::AESKey { key } => key.clone(),
                 SecureObject::UserID { value } => value.clone(),
                 SecureObject::Counter { value } => value.to_be_bytes().to_vec(),
-                SecureObject::HMACKey { key } => key.clone(),
+                SecureObject::HMACKey { key, policy } => {
+                    // Applet 7.2 refuses to export a symmetric key object
+                    // unless the policy attached at creation grants
+                    // POLICY_OBJ_ALLOW_READ; an object created with no
+                    // policy attached is not readable. This is the ECDH
+                    // derive target readback contract, enforced only in
+                    // strict mode so hosts that predate it keep working.
+                    if strict
+                        && policy.map_or(true,
+                            |p| p & crate::policy::POLICY_OBJ_ALLOW_READ == 0)
+                    {
+                        return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
+                    }
+                    key.clone()
+                }
             };
             ApduResponse::success_with_tlvs(&[Tlv::new(TAG_1, &data)])
         }
@@ -346,4 +362,83 @@ fn handle_delete(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
 
     store.remove(&obj_id);
     ApduResponse::success()
+}
+
+#[cfg(test)]
+mod read_policy_tests {
+    use super::*;
+    use crate::policy::POLICY_OBJ_ALLOW_READ;
+
+    fn read_apdu(obj_id: [u8; 4]) -> ParsedApdu {
+        ParsedApdu {
+            cla: 0x80,
+            ins: INS_READ,
+            p1: P1_DEFAULT,
+            p2: P2_DEFAULT,
+            data: vec![TAG_1, 0x04, obj_id[0], obj_id[1], obj_id[2], obj_id[3]],
+            le: None,
+        }
+    }
+
+    #[test]
+    fn test_strict_read_hmackey_without_policy_returns_6986() {
+        // Applet 7.2 behavior seen on SE05x hardware: an HMACKey object
+        // created with no policy attached cannot be read back, so the
+        // ECDH shared secret export fails unless the derive target was
+        // created with a read policy.
+        let mut store = ObjectStore::new();
+        store.insert([0, 0, 0, 0x66],
+            SecureObject::HMACKey { key: vec![0xAB; 32], policy: None });
+        let resp = handle_read(&read_apdu([0, 0, 0, 0x66]), &mut store, true);
+        assert_eq!(resp.sw, SW_COMMAND_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn test_strict_read_hmackey_policy_without_read_returns_6986() {
+        let mut store = ObjectStore::new();
+        store.insert([0, 0, 0, 0x66],
+            SecureObject::HMACKey { key: vec![0xAB; 32], policy: Some(0x0014_0000) });
+        let resp = handle_read(&read_apdu([0, 0, 0, 0x66]), &mut store, true);
+        assert_eq!(resp.sw, SW_COMMAND_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn test_strict_read_hmackey_with_read_policy_succeeds() {
+        let key = vec![0xABu8; 32];
+        let mut store = ObjectStore::new();
+        store.insert([0, 0, 0, 0x66],
+            SecureObject::HMACKey {
+                key: key.clone(),
+                policy: Some(POLICY_OBJ_ALLOW_READ | 0x0014_0000),
+            });
+        let resp = handle_read(&read_apdu([0, 0, 0, 0x66]), &mut store, true);
+        assert_eq!(resp.sw, 0x9000);
+        let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
+        assert_eq!(tlv::find_tlv(&tlvs, TAG_1).unwrap().value, key);
+    }
+
+    #[test]
+    fn test_lenient_read_hmackey_without_policy_succeeds() {
+        // Hosts that predate the applet 7.2 contract keep working when
+        // strict mode is off.
+        let key = vec![0xABu8; 32];
+        let mut store = ObjectStore::new();
+        store.insert([0, 0, 0, 0x66],
+            SecureObject::HMACKey { key: key.clone(), policy: None });
+        let resp = handle_read(&read_apdu([0, 0, 0, 0x66]), &mut store, false);
+        assert_eq!(resp.sw, 0x9000);
+    }
+
+    #[test]
+    fn test_strict_read_size_of_unreadable_hmackey_succeeds() {
+        // Only the object content is policy-guarded; ReadSize must keep
+        // working since sss_key_store_get_key sizes its buffer with it.
+        let mut store = ObjectStore::new();
+        store.insert([0, 0, 0, 0x66],
+            SecureObject::HMACKey { key: vec![0xAB; 32], policy: None });
+        let mut apdu = read_apdu([0, 0, 0, 0x66]);
+        apdu.p2 = P2_SIZE;
+        let resp = handle_read(&apdu, &mut store, true);
+        assert_eq!(resp.sw, 0x9000);
+    }
 }

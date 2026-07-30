@@ -463,7 +463,10 @@ pub fn handle_verify(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse
 
 /// Whether the applet 7.2 strict ECDH InObject contract is enforced.
 /// Off by default so hosts that predate the contract keep working; set
-/// SE050_SIM_STRICT_ECDH=1 to enforce it.
+/// SE050_SIM_STRICT_ECDH=1 to enforce it. Strict mode also enforces the
+/// derive-target read policy: ReadObject on an HMACKey object is refused
+/// with SW_COMMAND_NOT_ALLOWED unless the policy attached at creation
+/// grants POLICY_OBJ_ALLOW_READ (see object_mgmt::handle_read).
 pub fn strict_ecdh_from_env() -> bool {
     std::env::var("SE050_SIM_STRICT_ECDH").map(|v| v == "1").unwrap_or(false)
 }
@@ -518,9 +521,9 @@ pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore, strict: bool) -> 
     // On the real applet the Tag7 target must already exist as an HMACKey
     // object; the applet refuses to create it implicitly. In lenient mode a
     // missing (or non-HMACKey) target keeps the legacy implicit-create
-    // behavior instead (target_len None).
-    let target_len = match store.get(&output_id) {
-        Some(SecureObject::HMACKey { key }) => Some(key.len()),
+    // behavior instead (target None).
+    let target = match store.get(&output_id) {
+        Some(SecureObject::HMACKey { key, policy }) => Some((key.len(), *policy)),
         _ if strict => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
         _ => None,
     };
@@ -543,12 +546,14 @@ pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore, strict: bool) -> 
 
     match shared_secret {
         Some(secret) => {
-            match target_len {
-                Some(len) => {
+            match target {
+                Some((len, policy)) => {
                     if secret.len() != len {
                         return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
                     }
-                    store.insert(output_id, SecureObject::HMACKey { key: secret });
+                    // The derive overwrites the object's value; the policy
+                    // attached at creation stays with the object.
+                    store.insert(output_id, SecureObject::HMACKey { key: secret, policy });
                 }
                 None => {
                     // Legacy lenient behavior: implicitly create the target
@@ -726,7 +731,8 @@ mod tests {
         // HMACKey, in strict and lenient mode alike.
         for strict in [true, false] {
             let (apdu, mut store, _) = ecdh_inobject_fixture();
-            store.insert([0, 0, 0, 0x66], SecureObject::HMACKey { key: vec![0u8; 16] });
+            store.insert([0, 0, 0, 0x66],
+                SecureObject::HMACKey { key: vec![0u8; 16], policy: None });
             let resp = handle_ecdh(&apdu, &mut store, strict);
             assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED, "strict={}", strict);
         }
@@ -736,13 +742,34 @@ mod tests {
     fn test_ecdh_tag7_precreated_hmackey_succeeds_both_modes() {
         for strict in [true, false] {
             let (apdu, mut store, expected) = ecdh_inobject_fixture();
-            store.insert([0, 0, 0, 0x66], SecureObject::HMACKey { key: vec![0u8; 32] });
+            store.insert([0, 0, 0, 0x66],
+                SecureObject::HMACKey { key: vec![0u8; 32], policy: None });
             let resp = handle_ecdh(&apdu, &mut store, strict);
             assert_eq!(resp.sw, 0x9000, "strict={}", strict);
             match store.get(&[0, 0, 0, 0x66]) {
-                Some(SecureObject::HMACKey { key }) => assert_eq!(key, &expected),
+                Some(SecureObject::HMACKey { key, .. }) => assert_eq!(key, &expected),
                 other => panic!("expected HMACKey with shared secret, got {:?}", other.is_some()),
             }
+        }
+    }
+
+    #[test]
+    fn test_ecdh_preserves_target_policy() {
+        // The policy attached when the derive target was created must
+        // survive the derive overwriting the value, or a subsequent
+        // strict-mode ReadObject of the shared secret would be refused.
+        let (apdu, mut store, expected) = ecdh_inobject_fixture();
+        let policy = Some(crate::policy::POLICY_OBJ_ALLOW_READ);
+        store.insert([0, 0, 0, 0x66],
+            SecureObject::HMACKey { key: vec![0u8; 32], policy });
+        let resp = handle_ecdh(&apdu, &mut store, true);
+        assert_eq!(resp.sw, 0x9000);
+        match store.get(&[0, 0, 0, 0x66]) {
+            Some(SecureObject::HMACKey { key, policy: p }) => {
+                assert_eq!(key, &expected);
+                assert_eq!(*p, policy);
+            }
+            other => panic!("expected HMACKey, got {:?}", other.is_some()),
         }
     }
 

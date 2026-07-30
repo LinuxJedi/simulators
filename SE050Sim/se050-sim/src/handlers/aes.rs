@@ -22,7 +22,7 @@
 use crate::apdu::*;
 use crate::object_store::types::SecureObject;
 use crate::object_store::{CryptoObjectState, ObjectStore};
-use crate::tlv::{self, Tlv, TAG_1, TAG_2, TAG_3, TAG_4};
+use crate::tlv::{self, Tlv, TAG_1, TAG_2, TAG_3, TAG_4, TAG_POLICY};
 
 use aes::cipher::{BlockEncrypt, BlockDecrypt, KeyInit};
 use aes::cipher::generic_array::GenericArray;
@@ -82,8 +82,10 @@ pub fn handle_write_aes_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduR
 }
 
 /// Handle WRITE HMAC key command (WriteSymmKey with P1=HMAC).
-/// Tag1=obj_id(4B), Tag3=key_data. HMAC keys have no fixed length, so any
-/// non-empty Tag3 value is accepted as-is.
+/// Policy(opt), Tag1=obj_id(4B), Tag3=key_data. HMAC keys have no fixed
+/// length, so any non-empty Tag3 value is accepted as-is. An attached
+/// policy is recorded with the object; the applet 7.2 read-policy
+/// contract (see handle_read_object) keys off it.
 pub fn handle_write_hmac_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
@@ -99,9 +101,12 @@ pub fn handle_write_hmac_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> Apdu
         _ => return ApduResponse::error(SW_WRONG_DATA),
     };
 
+    let policy = tlv::find_tlv(&tlvs, TAG_POLICY)
+        .and_then(|t| crate::policy::ar_header_union(&t.value));
+
     match tlv::find_tlv(&tlvs, TAG_3) {
         Some(t) if !t.value.is_empty() => {
-            store.insert(obj_id, SecureObject::HMACKey { key: t.value.clone() });
+            store.insert(obj_id, SecureObject::HMACKey { key: t.value.clone(), policy });
             ApduResponse::success()
         }
         _ => ApduResponse::error(SW_WRONG_DATA),
@@ -441,7 +446,44 @@ mod hmac_write_tests {
         let resp = dispatch(&apdu, &mut store);
         assert_eq!(resp.sw, 0x9000);
         match store.get(&[0x00, 0x00, 0x00, 0x66]) {
-            Some(SecureObject::HMACKey { key: stored }) => assert_eq!(stored, &key),
+            Some(SecureObject::HMACKey { key: stored, policy }) => {
+                assert_eq!(stored, &key);
+                assert_eq!(*policy, None);
+            }
+            _ => panic!("HMACKey object not stored"),
+        }
+    }
+
+    #[test]
+    fn test_write_hmac_key_records_policy() {
+        // WriteSymmKey with a leading policy TLV, as sent by
+        // sss_key_store_set_key when an sss_policy_t is attached. One
+        // entry: len=8, authId=0, AR header granting read.
+        let key = vec![0x5Au8; 32];
+        let header: u32 = crate::policy::POLICY_OBJ_ALLOW_READ | 0x0014_0000;
+        let mut data = vec![crate::tlv::TAG_POLICY, 0x09, 0x08, 0x00, 0x00, 0x00, 0x00];
+        data.extend_from_slice(&header.to_be_bytes());
+        data.extend_from_slice(&[TAG_1, 0x04, 0x00, 0x00, 0x00, 0x67]);
+        data.push(TAG_3);
+        data.push(key.len() as u8);
+        data.extend_from_slice(&key);
+
+        let apdu = ParsedApdu {
+            cla: 0x80,
+            ins: 0x21,
+            p1: P1_HMAC,
+            p2: P2_DEFAULT,
+            data,
+            le: None,
+        };
+        let mut store = ObjectStore::new();
+        let resp = dispatch(&apdu, &mut store);
+        assert_eq!(resp.sw, 0x9000);
+        match store.get(&[0x00, 0x00, 0x00, 0x67]) {
+            Some(SecureObject::HMACKey { key: stored, policy }) => {
+                assert_eq!(stored, &key);
+                assert_eq!(*policy, Some(header));
+            }
             _ => panic!("HMACKey object not stored"),
         }
     }
