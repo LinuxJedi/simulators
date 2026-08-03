@@ -10,9 +10,12 @@ embedded-hal = "0.2"
 crc16 = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+p192 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
+elliptic-curve = { version = "0.13", features = ["ecdh"] }
 p224 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 p384 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+p521 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -21,6 +24,8 @@ cbc = { version = "0.1", features = ["alloc"] }
 rsa = { version = "0.9", features = ["sha2", "hazmat"] }
 sha1 = "0.10"
 sha2 = "0.10"
+hmac = "0.12"
+cmac = "0.7"
 signature = "2.2"
 rand = "0.8"
 hex = "0.4"

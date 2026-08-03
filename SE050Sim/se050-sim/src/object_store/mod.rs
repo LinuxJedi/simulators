@@ -28,7 +28,11 @@ use types::SecureObject;
 /// Hex-encoded 4-byte object ID used as JSON key.
 type ObjectIdKey = String;
 
-/// State for a transient crypto object (digest or cipher context).
+/// All five EC curve parameters (A, B, G, N, PRIME) present, matching
+/// the kSE05x_ECCurveParam bit assignments.
+pub const CURVE_PARAMS_COMPLETE: u8 = 0x1F;
+
+/// State for a transient crypto object (digest, cipher, or MAC context).
 #[derive(Debug, Clone)]
 pub enum CryptoObjectState {
     Digest {
@@ -37,9 +41,19 @@ pub enum CryptoObjectState {
     },
     Cipher {
         encrypting: bool,
+        mode: u8,
         key_id: [u8; 4],
-        iv: Vec<u8>,
-        accumulated: Vec<u8>,
+        /// CBC chaining vector / CTR counter, advanced as blocks are
+        /// processed across CipherUpdate calls.
+        chain: Vec<u8>,
+        /// Input bytes not yet processed (less than one block).
+        pending: Vec<u8>,
+    },
+    Mac {
+        algo: u8,
+        validate: bool,
+        key_id: [u8; 4],
+        data: Vec<u8>,
     },
 }
 
@@ -47,10 +61,21 @@ pub enum CryptoObjectState {
 pub struct ObjectStore {
     objects: HashMap<[u8; 4], SecureObject>,
     persist_path: Option<PathBuf>,
-    /// Transient crypto objects (digest/cipher contexts), keyed by 2-byte crypto object ID.
+    /// EC curve objects: curve ID -> bitmask of uploaded parameters
+    /// (kSE05x_ECCurveParam bits; CURVE_PARAMS_COMPLETE = usable).
+    /// Real applets ship with no curves created; the simulator
+    /// pre-provisions its supported NIST curves so hosts that predate
+    /// curve management keep working out of the box.
+    ec_curves: HashMap<u8, u8>,
+    /// Transient crypto objects (digest/cipher/MAC contexts), keyed by 2-byte crypto object ID.
     pub crypto_objects: HashMap<u16, CryptoObjectState>,
     /// Registry of created crypto object types (ID -> (context_type, subtype)).
     pub crypto_object_types: HashMap<u16, (u8, u8)>,
+}
+
+fn default_curves() -> HashMap<u8, u8> {
+    // P-192, P-224, P-256, P-384, P-521 fully parameterized.
+    (0x01..=0x05).map(|id| (id, CURVE_PARAMS_COMPLETE)).collect()
 }
 
 impl ObjectStore {
@@ -58,6 +83,7 @@ impl ObjectStore {
         Self {
             objects: HashMap::new(),
             persist_path: None,
+            ec_curves: default_curves(),
             crypto_objects: HashMap::new(),
             crypto_object_types: HashMap::new(),
         }
@@ -67,6 +93,7 @@ impl ObjectStore {
         let mut store = Self {
             objects: HashMap::new(),
             persist_path: Some(path.clone()),
+            ec_curves: default_curves(),
             crypto_objects: HashMap::new(),
             crypto_object_types: HashMap::new(),
         };
@@ -104,7 +131,14 @@ impl ObjectStore {
     }
 
     pub fn clear(&mut self) {
+        // DeleteAll on a real applet also deletes created curves and
+        // crypto objects. The simulator re-provisions its default
+        // curve set afterwards (see ec_curves) so key generation keeps
+        // working for hosts that never create curves themselves.
         self.objects.clear();
+        self.ec_curves = default_curves();
+        self.crypto_objects.clear();
+        self.crypto_object_types.clear();
         self.persist();
     }
 
@@ -112,14 +146,67 @@ impl ObjectStore {
         self.objects.len()
     }
 
+    // ---- EC curve object state ----
+
+    /// Curve exists (parameterized or not). A created but param-less
+    /// curve still shows as SET in ReadECCurveList on real applets.
+    pub fn curve_exists(&self, curve_id: u8) -> bool {
+        self.ec_curves.contains_key(&curve_id)
+    }
+
+    /// Curve exists and all five parameters have been uploaded; only
+    /// then do key operations on it succeed (bench-verified: keygen on
+    /// a param-less curve fails 0x6985 on applet 3.1.1 and 7.2.0).
+    pub fn curve_ready(&self, curve_id: u8) -> bool {
+        self.ec_curves.get(&curve_id) == Some(&CURVE_PARAMS_COMPLETE)
+    }
+
+    /// Create a curve object with no parameters uploaded yet.
+    pub fn curve_create(&mut self, curve_id: u8) {
+        self.ec_curves.insert(curve_id, 0);
+        self.persist();
+    }
+
+    /// Reset an existing curve to the parameter-less state (applet
+    /// 3.1.1 duplicate-CreateECCurve behavior).
+    pub fn curve_reset(&mut self, curve_id: u8) {
+        self.ec_curves.insert(curve_id, 0);
+        self.persist();
+    }
+
+    /// Record an uploaded curve parameter (kSE05x_ECCurveParam bit).
+    pub fn curve_add_param(&mut self, curve_id: u8, param: u8) {
+        if let Some(mask) = self.ec_curves.get_mut(&curve_id) {
+            *mask |= param & CURVE_PARAMS_COMPLETE;
+            self.persist();
+        }
+    }
+
+    pub fn curve_delete(&mut self, curve_id: u8) -> bool {
+        let removed = self.ec_curves.remove(&curve_id).is_some();
+        if removed {
+            self.persist();
+        }
+        removed
+    }
+
     fn persist(&self) {
         let Some(path) = &self.persist_path else { return };
-        let serializable: HashMap<ObjectIdKey, &SecureObject> = self
+        let objects: HashMap<ObjectIdKey, &SecureObject> = self
             .objects
             .iter()
             .map(|(k, v)| (hex::encode(k), v))
             .collect();
-        if let Ok(json) = serde_json::to_string_pretty(&serializable) {
+        let curves: HashMap<String, u8> = self
+            .ec_curves
+            .iter()
+            .map(|(k, v)| (format!("{:02x}", k), *v))
+            .collect();
+        let doc = serde_json::json!({
+            "objects": objects,
+            "ec_curves": curves,
+        });
+        if let Ok(json) = serde_json::to_string_pretty(&doc) {
             let _ = std::fs::write(path, json);
         }
     }
@@ -127,8 +214,30 @@ impl ObjectStore {
     fn load(&mut self) {
         let Some(path) = &self.persist_path else { return };
         let Ok(json) = std::fs::read_to_string(path) else { return };
+        let Ok(value): Result<serde_json::Value, _> = serde_json::from_str(&json) else {
+            return;
+        };
+
+        // Current schema: {"objects": {...}, "ec_curves": {...}}.
+        // Legacy schema (pre curve-state): a flat hex-id -> object map.
+        let objects_value = if value.get("objects").is_some() {
+            if let Some(curves) = value.get("ec_curves").and_then(|v| v.as_object()) {
+                self.ec_curves = curves
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let id = u8::from_str_radix(k, 16).ok()?;
+                        let mask = v.as_u64()? as u8;
+                        Some((id, mask))
+                    })
+                    .collect();
+            }
+            value.get("objects").cloned().unwrap_or_default()
+        } else {
+            value
+        };
+
         let Ok(deserialized): Result<HashMap<ObjectIdKey, SecureObject>, _> =
-            serde_json::from_str(&json)
+            serde_json::from_value(objects_value)
         else {
             return;
         };
@@ -147,5 +256,49 @@ impl ObjectStore {
 impl Default for ObjectStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn test_legacy_flat_store_file_still_loads() {
+        // Pre-curve-state store files are a flat hex-id -> object map;
+        // they must keep loading (with the default curve set) so
+        // existing on-disk stores survive the schema change.
+        let dir = std::env::temp_dir();
+        let path = dir.join("se050_sim_legacy_store_test.json");
+        let legacy = r#"{
+            "00000042": { "Binary": { "data": [1, 2, 3] } }
+        }"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let store = ObjectStore::with_persistence(path.clone());
+        match store.get(&[0, 0, 0, 0x42]) {
+            Some(SecureObject::Binary { data }) => assert_eq!(data, &vec![1, 2, 3]),
+            other => panic!("legacy object missing: {:?}", other.is_some()),
+        }
+        assert!(store.curve_ready(0x03), "default curves provisioned");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_curve_state_round_trips_through_persistence() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("se050_sim_curve_store_test.json");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut store = ObjectStore::with_persistence(path.clone());
+            store.curve_delete(0x01);
+            store.curve_create(0x06); // brainpool160r1, param-less
+        }
+        let store = ObjectStore::with_persistence(path.clone());
+        assert!(!store.curve_exists(0x01));
+        assert!(store.curve_exists(0x06));
+        assert!(!store.curve_ready(0x06));
+        assert!(store.curve_ready(0x03));
+        let _ = std::fs::remove_file(&path);
     }
 }

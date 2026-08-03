@@ -280,7 +280,7 @@ pub fn handle_rsa_encrypt(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRes
 
     let key_obj = match store.get(&key_id) {
         Some(obj) => obj.clone(),
-        None => return ApduResponse::error(SW_FILE_NOT_FOUND),
+        None => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
     };
 
     let public_key = match public_key_from_obj(&key_obj) {
@@ -354,7 +354,7 @@ pub fn handle_rsa_decrypt(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRes
 
     let key_obj = match store.get(&key_id) {
         Some(obj) => obj.clone(),
-        None => return ApduResponse::error(SW_FILE_NOT_FOUND),
+        None => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
     };
 
     let SecureObject::RSAKeyPair { private_key_der, .. } = &key_obj else {
