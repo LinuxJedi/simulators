@@ -20,6 +20,7 @@
  */
 
 pub mod apdu;
+pub mod applet;
 pub mod dispatch;
 pub mod handlers;
 pub mod object_store;

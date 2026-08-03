@@ -23,13 +23,19 @@
 /// based on CLA, INS (masked with 0x1F), P1, and P2.
 
 use crate::apdu::*;
+use crate::applet::AppletVersion;
 use crate::handlers;
 use crate::object_store::ObjectStore;
 
 pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
+    // Applet personality (SE050_SIM_APPLET env var; defaults to the
+    // SE051 / applet 7.2.0 the simulator has always advertised).
+    let version = AppletVersion::from_env();
+    let v7 = version == AppletVersion::V7_2_0;
+
     // SELECT command (CLA=0x00, INS=0xA4)
     if apdu.cla == 0x00 && apdu.ins == 0xA4 {
-        return handlers::session::handle_select(apdu, store);
+        return handlers::session::handle_select(apdu, store, version);
     }
 
     // All other SE050 proprietary commands use CLA=0x80 or 0x84
@@ -47,10 +53,11 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
             P1_AES => handlers::aes::handle_write_aes_key(apdu, store),
             P1_HMAC => handlers::aes::handle_write_hmac_key(apdu, store),
             P1_CRYPTO_OBJ => handlers::crypto_obj::handle_create(apdu, store),
-            P1_CURVE => {
-                // CreateECCurve / SetECCurveParam: our crypto libs have curves built-in
-                ApduResponse::success()
-            }
+            P1_CURVE => match apdu.p2 {
+                P2_CREATE => handlers::curve::handle_create(apdu, store, version),
+                P2_PARAM => handlers::curve::handle_set_param(apdu, store),
+                _ => ApduResponse::error(SW_WRONG_P1P2),
+            },
             P1_BINARY | P1_USERID | P1_COUNTER => {
                 handlers::object_mgmt::handle_write(apdu, store)
             }
@@ -89,7 +96,7 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
                             ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED)
                         }
                     }
-                    _ => ApduResponse::error(SW_FILE_NOT_FOUND),
+                    _ => ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
                 }
             }
             (P1_CRYPTO_OBJ, _) => handlers::crypto_obj::handle_list(apdu, store),
@@ -105,22 +112,12 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
                             &[crate::tlv::Tlv::new(crate::tlv::TAG_1, &[cid])]),
                         None => ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
                     },
-                    None => ApduResponse::error(SW_FILE_NOT_FOUND),
+                    None => ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
                 }
             }
-            (P1_CURVE, _) => {
-                // ReadECCurveList: return 17-byte list marking all NIST curves as SET.
-                // Index = curve_id - 1, value 0x01 = SET, 0x00 = NOT_SET.
-                let mut curve_list = [0u8; 0x11]; // kSE05x_ECCurve_Total_Weierstrass_Curves
-                curve_list[0x00] = 0x01; // NIST_P192
-                curve_list[0x01] = 0x01; // NIST_P224
-                curve_list[0x02] = 0x01; // NIST_P256
-                curve_list[0x03] = 0x01; // NIST_P384
-                curve_list[0x04] = 0x01; // NIST_P521
-                ApduResponse::success_with_tlvs(
-                    &[crate::tlv::Tlv::new(crate::tlv::TAG_1, &curve_list)])
-            }
-            _ => handlers::object_mgmt::handle_read(apdu, store),
+            (P1_CURVE, P2_LIST) => handlers::curve::handle_list(store),
+            (P1_CURVE, _) => ApduResponse::error(SW_WRONG_P1P2),
+            _ => handlers::object_mgmt::handle_read(apdu, store, v7),
         },
 
         INS_CRYPTO => match (cred_type, apdu.p2) {
@@ -163,6 +160,15 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
             (P1_DEFAULT, P2_UPDATE) => handlers::digest::handle_digest_update(apdu, store),
             (P1_DEFAULT, P2_FINAL) => handlers::digest::handle_digest_final(apdu, store),
 
+            // MAC (HMAC / AES-CMAC): one-shot and multi-step.
+            // MACInit uses P2 = Generate (0x03) / Validate (0x44).
+            (P1_MAC, P2_GENERATE_ONESHOT) => handlers::mac::handle_oneshot(apdu, store, false),
+            (P1_MAC, P2_VALIDATE_ONESHOT) => handlers::mac::handle_oneshot(apdu, store, true),
+            (P1_MAC, P2_GENERATE) => handlers::mac::handle_init(apdu, store, false),
+            (P1_MAC, P2_MAC_VALIDATE) => handlers::mac::handle_init(apdu, store, true),
+            (P1_MAC, P2_UPDATE) => handlers::mac::handle_update(apdu, store),
+            (P1_MAC, P2_FINAL) => handlers::mac::handle_final(apdu, store),
+
             _ => ApduResponse::error(SW_WRONG_P1P2),
         },
 
@@ -172,9 +178,13 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
                 (P1_CRYPTO_OBJ, P2_DELETE_OBJECT) => {
                     handlers::crypto_obj::handle_delete(apdu, store)
                 }
+                // EC curve deletion
+                (P1_CURVE, P2_DELETE_OBJECT) => {
+                    handlers::curve::handle_delete(apdu, store)
+                }
                 // General management
                 (_, P2_VERSION) | (_, P2_MEMORY) | (_, P2_RANDOM) | (_, P2_DELETE_ALL) => {
-                    handlers::management::handle(apdu, store)
+                    handlers::management::handle(apdu, store, version)
                 }
                 (_, P2_EXIST) | (_, P2_DELETE_OBJECT) => {
                     handlers::object_mgmt::handle_mgmt(apdu, store)

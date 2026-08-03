@@ -47,6 +47,12 @@ pub fn handle_create(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse
         _ => 0x00,
     };
 
+    // Re-creating an existing crypto object fails 0x6986
+    // (bench-verified on applet 3.1.1 and 7.2.0).
+    if store.crypto_object_types.contains_key(&crypto_id) {
+        return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
+    }
+
     store.crypto_object_types.insert(crypto_id, (context_type, subtype));
     ApduResponse::success()
 }

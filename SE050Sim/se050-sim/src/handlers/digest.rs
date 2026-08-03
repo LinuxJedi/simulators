@@ -37,7 +37,8 @@ fn compute_hash(mode: u8, data: &[u8]) -> Option<Vec<u8>> {
 
 /// Handle Digest OneShot command.
 /// INS=Crypto, P1=Default, P2=Oneshot
-/// Tag1=digest_mode(1B), Tag2=data_to_hash
+/// Tag1=digest_mode(1B), Tag2=data_to_hash (optional/empty: real
+/// applets hash the empty message, bench-verified on 3.1.1 and 7.2.0)
 pub fn handle_digest_oneshot(apdu: &ParsedApdu, _store: &mut ObjectStore) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
@@ -49,12 +50,11 @@ pub fn handle_digest_oneshot(apdu: &ParsedApdu, _store: &mut ObjectStore) -> Apd
         _ => return ApduResponse::error(SW_WRONG_DATA),
     };
 
-    let data = match tlv::find_tlv(&tlvs, TAG_2) {
-        Some(t) => &t.value,
-        None => return ApduResponse::error(SW_WRONG_DATA),
-    };
+    let data = tlv::find_tlv(&tlvs, TAG_2)
+        .map(|t| t.value.clone())
+        .unwrap_or_default();
 
-    match compute_hash(digest_mode, data) {
+    match compute_hash(digest_mode, &data) {
         Some(hash) => ApduResponse::success_with_tlvs(&[Tlv::new(TAG_1, &hash)]),
         None => ApduResponse::error(SW_WRONG_DATA),
     }
@@ -62,16 +62,14 @@ pub fn handle_digest_oneshot(apdu: &ParsedApdu, _store: &mut ObjectStore) -> Apd
 
 /// Handle DigestInit.
 /// INS=Crypto, P1=Default, P2=Init(0x0B)
-/// Tag1=digest_mode(1B), Tag2=cryptoObjectID(2B)
+/// Tag2=cryptoObjectID(2B). The digest algorithm comes from the
+/// crypto object's CreateCryptoObject subtype; the SDK sends no algo
+/// TLV here. Init on a never-created crypto object fails 0x6985
+/// (bench-verified on applet 3.1.1 and 7.2.0).
 pub fn handle_digest_init(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
         Err(_) => return ApduResponse::error(SW_WRONG_DATA),
-    };
-
-    let algo = match tlv::find_tlv(&tlvs, TAG_1) {
-        Some(t) if !t.value.is_empty() => t.value[0],
-        _ => return ApduResponse::error(SW_WRONG_DATA),
     };
 
     let crypto_id = match tlv::find_tlv(&tlvs, TAG_2) {
@@ -79,10 +77,18 @@ pub fn handle_digest_init(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRes
         _ => return ApduResponse::error(SW_WRONG_DATA),
     };
 
+    let Some(&(context, subtype)) = store.crypto_object_types.get(&crypto_id) else {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    // kSE05x_CryptoContext_DIGEST
+    if context != 0x01 {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
+
     store.crypto_objects.insert(
         crypto_id,
         CryptoObjectState::Digest {
-            algo,
+            algo: subtype,
             data: Vec::new(),
         },
     );
