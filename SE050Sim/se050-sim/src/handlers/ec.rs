@@ -463,27 +463,34 @@ pub fn handle_verify(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse
 
 /// Whether the applet 7.2 strict ECDH InObject contract is enforced.
 /// Off by default so hosts that predate the contract keep working; set
-/// SE050_SIM_STRICT_ECDH=1 to enforce it. Note the symmetric key read
-/// policy is unrelated to this switch: ReadObject on an HMACKey object
-/// without POLICY_OBJ_ALLOW_READ is always refused, as every real
-/// applet generation does (see object_mgmt::handle_read).
+/// SE050_SIM_STRICT_ECDH=1 to enforce it. The direct (Tag7-less)
+/// variant is valid in both modes, and ReadObject on HMACKey objects is
+/// always refused regardless of this switch or any attached policy, as
+/// on real applets (see object_mgmt::handle_read).
 pub fn strict_ecdh_from_env() -> bool {
     std::env::var("SE050_SIM_STRICT_ECDH").map(|v| v == "1").unwrap_or(false)
 }
 
 /// Handle ECDH shared secret generation.
 /// INS=Crypto, P1=EC, P2=DH(0x0F)
-/// Tag1=privateKeyID(4B), Tag2=peerPublicKey, Tag7=sharedSecretOutputID(4B)
-/// Per the SE05x IoT applet spec (7.2+, see Se05x_API_ECDHGenerateSharedSecret
-/// in the Plug & Trust middleware), the Tag7 target must reference an existing
-/// HMACKey object whose size equals the shared secret exactly; otherwise the
-/// applet returns SW_CONDITIONS_NOT_SATISFIED. The shared secret overwrites
-/// that object's value.
+/// Tag1=privateKeyID(4B), Tag2=peerPublicKey, Tag7=sharedSecretOutputID(4B,
+/// optional).
+/// Without Tag7 this is the direct variant
+/// (Se05x_API_ECDHGenerateSharedSecret): the shared secret is returned in
+/// the response Tag1 and no object is created; big endian for Montgomery
+/// curves, as on real applets. This is the only way a host can obtain the
+/// secret on applet >= 7.2, which refuses to export symmetric key objects
+/// regardless of policy (verified on SE051 applet 7.2.0 hardware).
+/// With Tag7 this is the InObject variant: the target must reference an
+/// existing HMACKey object whose size equals the shared secret exactly,
+/// otherwise the applet returns SW_CONDITIONS_NOT_SATISFIED; the secret
+/// overwrites that object's value (little endian for Montgomery, matching
+/// the SDK convention).
 /// With `strict` false (the default, see strict_ecdh_from_env) a missing
-/// target instead falls back to the legacy simulator behavior of implicitly
-/// creating a Binary object, so hosts that predate the applet 7.2 contract
-/// keep working. A pre-existing HMACKey target gets the exact-size contract
-/// in both modes.
+/// InObject target instead falls back to the legacy simulator behavior of
+/// implicitly creating a Binary object, so hosts that predate the applet
+/// 7.2 contract keep working. A pre-existing HMACKey target gets the
+/// exact-size contract in both modes.
 pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore, strict: bool) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
@@ -504,13 +511,19 @@ pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore, strict: bool) -> 
         _ => return ApduResponse::error(SW_WRONG_DATA),
     };
 
-    let output_id = match tlv::find_tlv(&tlvs, TAG_7) {
+    // Tag7 absent selects the direct variant
+    // (Se05x_API_ECDHGenerateSharedSecret): the shared secret is returned
+    // in the response and no object is touched. Tag7 present selects the
+    // InObject variant. Both are valid on every real applet generation;
+    // the strict target contract only applies to the InObject form.
+    let output_id: Option<[u8; 4]> = match tlv::find_tlv(&tlvs, TAG_7) {
         Some(t) if t.value.len() == 4 => {
             let mut id = [0u8; 4];
             id.copy_from_slice(&t.value);
-            id
+            Some(id)
         }
-        _ => return ApduResponse::error(SW_WRONG_DATA),
+        Some(_) => return ApduResponse::error(SW_WRONG_DATA),
+        None => None,
     };
 
     let key_obj = match store.get(&key_id) {
@@ -522,11 +535,18 @@ pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore, strict: bool) -> 
     // object; the applet refuses to create it implicitly. In lenient mode a
     // missing (or non-HMACKey) target keeps the legacy implicit-create
     // behavior instead (target None).
-    let target = match store.get(&output_id) {
-        Some(SecureObject::HMACKey { key, policy }) => Some((key.len(), *policy)),
-        _ if strict => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
-        _ => None,
+    let target = match output_id {
+        Some(oid) => match store.get(&oid) {
+            Some(SecureObject::HMACKey { key, policy }) =>
+                Some((key.len(), *policy)),
+            _ if strict => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
+            _ => None,
+        },
+        None => None,
     };
+
+    let is_mont = matches!(&key_obj,
+        SecureObject::ECKeyPair { curve: ECCurve::Curve25519, .. });
 
     let shared_secret = match &key_obj {
         SecureObject::ECKeyPair { curve: ECCurve::NistP224, private_key, .. } => {
@@ -546,6 +566,22 @@ pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore, strict: bool) -> 
 
     match shared_secret {
         Some(secret) => {
+            let oid = match output_id {
+                None => {
+                    // Direct variant: the secret goes out in the response.
+                    // The applet speaks big endian for Montgomery curves
+                    // (the middleware byte swaps around the call), while
+                    // the InObject store below keeps the little endian
+                    // convention the SDK reads back.
+                    let mut resp = secret;
+                    if is_mont {
+                        resp.reverse();
+                    }
+                    return ApduResponse::success_with_tlvs(
+                        &[Tlv::new(TAG_1, &resp)]);
+                }
+                Some(oid) => oid,
+            };
             match target {
                 Some((len, policy)) => {
                     if secret.len() != len {
@@ -553,12 +589,12 @@ pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore, strict: bool) -> 
                     }
                     // The derive overwrites the object's value; the policy
                     // attached at creation stays with the object.
-                    store.insert(output_id, SecureObject::HMACKey { key: secret, policy });
+                    store.insert(oid, SecureObject::HMACKey { key: secret, policy });
                 }
                 None => {
                     // Legacy lenient behavior: implicitly create the target
                     // as a Binary object.
-                    store.insert(output_id, SecureObject::Binary { data: secret });
+                    store.insert(oid, SecureObject::Binary { data: secret });
                 }
             }
             ApduResponse::success()
@@ -751,6 +787,66 @@ mod tests {
                 other => panic!("expected HMACKey with shared secret, got {:?}", other.is_some()),
             }
         }
+    }
+
+    #[test]
+    fn test_ecdh_direct_no_tag7_returns_secret_both_modes() {
+        // Without Tag7 the applet returns the shared secret in the
+        // response and touches no object, in strict and lenient mode
+        // alike. This is how hosts on applet >= 7.2 obtain the secret.
+        for strict in [true, false] {
+            let (mut apdu, mut store, expected) = ecdh_inobject_fixture();
+            // Rebuild the request without the Tag7 TLV, extracting the
+            // peer public key by TLV parsing rather than fixed offsets.
+            let orig = crate::tlv::parse_tlvs(&apdu.data).unwrap();
+            let peer = tlv::find_tlv(&orig, TAG_2).unwrap().value.clone();
+            let mut data = tlv_bytes(TAG_1, &[0, 0, 0, 0x64]);
+            data.extend(tlv_bytes(TAG_2, &peer));
+            apdu.data = data;
+            let count_before = store.count();
+            let resp = handle_ecdh(&apdu, &mut store, strict);
+            assert_eq!(resp.sw, 0x9000, "strict={}", strict);
+            let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
+            assert_eq!(tlv::find_tlv(&tlvs, TAG_1).unwrap().value, expected,
+                "strict={}", strict);
+            assert_eq!(store.count(), count_before, "no object may be created");
+            assert!(store.get(&[0, 0, 0, 0x66]).is_none());
+        }
+    }
+
+    #[test]
+    fn test_ecdh_direct_x25519_secret_is_big_endian() {
+        // The applet speaks big endian for Montgomery curves; the SDK
+        // swaps around the direct call. Keys are stored reversed (BE).
+        let sk = x25519_dalek::StaticSecret::random_from_rng(&mut OsRng);
+        let pk = x25519_dalek::PublicKey::from(&sk);
+        let peer_sk = x25519_dalek::StaticSecret::random_from_rng(&mut OsRng);
+        let peer_pk = x25519_dalek::PublicKey::from(&peer_sk);
+        let mut expected_be = sk.diffie_hellman(&peer_pk).to_bytes().to_vec();
+        expected_be.reverse();
+
+        let mut priv_be = sk.to_bytes().to_vec();
+        priv_be.reverse();
+        let mut pub_be = pk.to_bytes().to_vec();
+        pub_be.reverse();
+        let mut peer_be = peer_pk.to_bytes().to_vec();
+        peer_be.reverse();
+
+        let mut store = ObjectStore::new();
+        store.insert([0, 0, 0, 0x64], SecureObject::ECKeyPair {
+            curve: ECCurve::Curve25519,
+            private_key: priv_be,
+            public_key: pub_be,
+        });
+        let mut data = tlv_bytes(TAG_1, &[0, 0, 0, 0x64]);
+        data.extend(tlv_bytes(TAG_2, &peer_be));
+        let apdu = ParsedApdu {
+            cla: 0x80, ins: 0x03, p1: P1_EC, p2: P2_DH, data, le: None,
+        };
+        let resp = handle_ecdh(&apdu, &mut store, true);
+        assert_eq!(resp.sw, 0x9000);
+        let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
+        assert_eq!(tlv::find_tlv(&tlvs, TAG_1).unwrap().value, expected_be);
     }
 
     #[test]

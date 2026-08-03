@@ -58,26 +58,6 @@ static ex_sss_boot_ctx_t g_ctx;
 static sss_se05x_session_t *g_session;
 static sss_se05x_key_store_t g_ks;
 
-/* An HMACKey object created with no policy attached cannot be read back
- * (the applet requires POLICY_OBJ_ALLOW_READ on symmetric key objects,
- * on every applet generation), so the ECDH derive targets are created
- * with a common policy granting read, write and delete. An attached
- * policy replaces the applet default entirely, so write (the ECDH
- * result) and delete (cleanup) must be granted explicitly as well. */
-static sss_policy_u g_derive_common_pol = {
-    .type = KPolicy_Common,
-    .auth_obj_id = 0,
-    .policy = { .common = {
-        .can_Read = 1,
-        .can_Write = 1,
-        .can_Delete = 1,
-    }},
-};
-static sss_policy_t g_derive_policy = {
-    .policies = { &g_derive_common_pol },
-    .nPolicies = 1,
-};
-
 /* Object ID base — use high range to avoid conflicts */
 #define OBJ_ID_BASE 0x10000000
 
@@ -346,13 +326,15 @@ static void test_ecdh(const char *name, uint32_t obj_a, uint32_t obj_b,
 {
     TEST_BEGIN(name);
     sss_status_t status;
-    sss_se05x_object_t key_a, key_b, derived_key;
-    sss_se05x_derive_key_t derive_ctx;
+    sss_se05x_object_t key_a, key_b;
 
     uint8_t shared[64] = {0};
     size_t shared_len = sizeof(shared);
-    size_t shared_bits = 0;
-    uint8_t dummy[64] = {0};
+    uint8_t pub_b[256];
+    size_t pub_b_len = sizeof(pub_b);
+    size_t pub_b_bits = 0;
+    size_t point_len;
+    smStatus_t sm;
 
     /* Generate two key pairs */
     cleanup_object(obj_a);
@@ -375,36 +357,25 @@ static void test_ecdh(const char *name, uint32_t obj_a, uint32_t obj_b,
     status = sss_key_store_generate_key(&g_ks, &key_b, key_bits, NULL);
     ASSERT_OK(status, "key_b generate");
 
-    /* Compute ECDH(A_priv, B_pub) */
-    sss_key_object_init(&derived_key, &g_ks);
-    status = sss_key_object_allocate_handle(&derived_key, obj_ss,
-        kSSS_KeyPart_Default, kSSS_CipherType_HMAC, key_bytes,
-        kKeyObject_Mode_Transient);
-    ASSERT_OK(status, "derived allocate");
-
-    status = sss_derive_key_context_init(&derive_ctx, &g_ctx.session,
-        &key_a, kAlgorithm_SSS_ECDH, kMode_SSS_ComputeSharedSecret);
-    ASSERT_OK(status, "derive_key_context_init");
-
-    sss_key_store_erase_key(&g_ks, &derived_key);
-    /* Applet 7.2+ stores the shared secret into a pre-existing HMACKey
-     * object whose size must equal the secret exactly; create it before
-     * the derive */
-    status = sss_key_store_set_key(&g_ks, &derived_key, dummy,
-        key_bytes, key_bytes * 8, &g_derive_policy,
-        sizeof(g_derive_policy));
-    ASSERT_OK(status, "derived pre-create");
-    status = sss_derive_key_dh(&derive_ctx, &key_b, &derived_key);
-    ASSERT_OK(status, "derive_key_dh");
-
-    sss_derive_key_context_free(&derive_ctx);
-
-    /* Read shared secret. sss_key_store_get_key has no HMAC read case, so
-     * read the object back as AES type (both are a plain ReadObject). */
-    derived_key.cipherType = kSSS_CipherType_AES;
-    status = sss_key_store_get_key(&g_ks, &derived_key,
-        shared, &shared_len, &shared_bits);
-    ASSERT_OK(status, "get shared secret");
+    /* Compute ECDH(A_priv, B_pub) via the direct APDU. The applet never
+     * exports a symmetric key object, not even with an attached read
+     * policy (verified on SE051 applet 7.2.0 hardware), so deriving into
+     * an SE05x object cannot be read back; the direct variant returns
+     * the shared secret in the response, as the middleware itself does
+     * when the derived key object lives in a host keystore. */
+    status = sss_key_store_get_key(&g_ks, &key_b,
+        pub_b, &pub_b_len, &pub_b_bits);
+    ASSERT_OK(status, "get key_b public");
+    point_len = (size_t)(1 + 2 * key_bytes);
+    if (pub_b_len < point_len || pub_b[pub_b_len - point_len] != 0x04) {
+        TEST_FAIL("key_b public point not found");
+    }
+    sm = Se05x_API_ECDHGenerateSharedSecret(&g_session->s_ctx, obj_a,
+        pub_b + pub_b_len - point_len, point_len, shared, &shared_len);
+    if (sm != SM_OK) {
+        TEST_FAILF("direct ECDH failed: 0x%04x", (unsigned)sm);
+    }
+    ASSERT_EQ(shared_len, (size_t)key_bytes, "shared secret length");
 
     /* Should not be all zeros */
     uint8_t zeros[64] = {0};
@@ -413,10 +384,9 @@ static void test_ecdh(const char *name, uint32_t obj_a, uint32_t obj_b,
     /* Cleanup */
     sss_key_store_erase_key(&g_ks, &key_a);
     sss_key_store_erase_key(&g_ks, &key_b);
-    sss_key_store_erase_key(&g_ks, &derived_key);
     sss_key_object_free(&key_a);
     sss_key_object_free(&key_b);
-    sss_key_object_free(&derived_key);
+    (void)obj_ss;
     TEST_PASS();
 }
 
@@ -1408,8 +1378,7 @@ static void test_x25519_ecdh(void)
 {
     TEST_BEGIN("X25519-ECDH");
     sss_status_t status;
-    sss_se05x_object_t key_a, key_b, derived_a, derived_b;
-    sss_se05x_derive_key_t derive_ctx;
+    sss_se05x_object_t key_a, key_b;
 
     uint32_t id_a = OBJ_ID_BASE + 60;
     uint32_t id_b = OBJ_ID_BASE + 61;
@@ -1418,9 +1387,13 @@ static void test_x25519_ecdh(void)
 
     uint8_t shared_a[32] = {0}, shared_b[32] = {0};
     size_t shared_a_len = sizeof(shared_a), shared_b_len = sizeof(shared_b);
-    size_t shared_bits = 0;
     uint8_t zeros[32] = {0};
-    uint8_t dummy[32] = {0};
+    uint8_t pub_der[64];
+    uint8_t point[32];
+    size_t pub_len, pub_bits;
+    smStatus_t sm;
+    int i;
+    uint8_t swp;
 
     cleanup_object(id_a);
     cleanup_object(id_b);
@@ -1445,55 +1418,52 @@ static void test_x25519_ecdh(void)
     status = sss_key_store_generate_key(&g_ks, &key_b, 256, NULL);
     ASSERT_OK(status, "x25519 key_b generate");
 
-    /* ECDH(A_priv, B_pub) */
-    sss_key_object_init(&derived_a, &g_ks);
-    status = sss_key_object_allocate_handle(&derived_a, id_ss_a,
-        kSSS_KeyPart_Default, kSSS_CipherType_HMAC, 32,
-        kKeyObject_Mode_Transient);
-    ASSERT_OK(status, "derived_a allocate");
-
-    /* Applet 7.2+: derive target must be a pre-existing HMACKey object
-     * sized exactly to the shared secret */
-    status = sss_key_store_set_key(&g_ks, &derived_a, dummy,
-        sizeof(dummy), sizeof(dummy) * 8, &g_derive_policy,
-        sizeof(g_derive_policy));
-    ASSERT_OK(status, "derived_a pre-create");
-
-    status = sss_derive_key_context_init(&derive_ctx, &g_ctx.session,
-        &key_a, kAlgorithm_SSS_ECDH, kMode_SSS_ComputeSharedSecret);
-    ASSERT_OK(status, "derive_a context_init");
-    status = sss_derive_key_dh(&derive_ctx, &key_b, &derived_a);
-    ASSERT_OK(status, "derive_a dh");
-    sss_derive_key_context_free(&derive_ctx);
-
-    derived_a.cipherType = kSSS_CipherType_AES;
-    status = sss_key_store_get_key(&g_ks, &derived_a,
-        shared_a, &shared_a_len, &shared_bits);
-    ASSERT_OK(status, "get shared_a");
+    /* ECDH(A_priv, B_pub) via the direct APDU (see test_ecdh); the
+     * applet speaks big endian for Montgomery keys, so the peer point
+     * and the returned secret are byte swapped around each call. */
+    pub_len = sizeof(pub_der);
+    pub_bits = 0;
+    status = sss_key_store_get_key(&g_ks, &key_b,
+        pub_der, &pub_len, &pub_bits);
+    ASSERT_OK(status, "get key_b public");
+    if (pub_len < 32) { TEST_FAIL("key_b public too short"); }
+    memcpy(point, pub_der + pub_len - 32, 32);
+    for (i = 0; i < 16; i++) {
+        swp = point[i]; point[i] = point[31 - i]; point[31 - i] = swp;
+    }
+    sm = Se05x_API_ECDHGenerateSharedSecret(&g_session->s_ctx, id_a,
+        point, sizeof(point), shared_a, &shared_a_len);
+    if (sm != SM_OK) {
+        TEST_FAILF("direct ECDH a failed: 0x%04x", (unsigned)sm);
+    }
+    for (i = 0; i < 16; i++) {
+        swp = shared_a[i]; shared_a[i] = shared_a[31 - i];
+        shared_a[31 - i] = swp;
+    }
 
     /* ECDH(B_priv, A_pub) */
-    sss_key_object_init(&derived_b, &g_ks);
-    status = sss_key_object_allocate_handle(&derived_b, id_ss_b,
-        kSSS_KeyPart_Default, kSSS_CipherType_HMAC, 32,
-        kKeyObject_Mode_Transient);
-    ASSERT_OK(status, "derived_b allocate");
+    pub_len = sizeof(pub_der);
+    pub_bits = 0;
+    status = sss_key_store_get_key(&g_ks, &key_a,
+        pub_der, &pub_len, &pub_bits);
+    ASSERT_OK(status, "get key_a public");
+    if (pub_len < 32) { TEST_FAIL("key_a public too short"); }
+    memcpy(point, pub_der + pub_len - 32, 32);
+    for (i = 0; i < 16; i++) {
+        swp = point[i]; point[i] = point[31 - i]; point[31 - i] = swp;
+    }
+    sm = Se05x_API_ECDHGenerateSharedSecret(&g_session->s_ctx, id_b,
+        point, sizeof(point), shared_b, &shared_b_len);
+    if (sm != SM_OK) {
+        TEST_FAILF("direct ECDH b failed: 0x%04x", (unsigned)sm);
+    }
+    for (i = 0; i < 16; i++) {
+        swp = shared_b[i]; shared_b[i] = shared_b[31 - i];
+        shared_b[31 - i] = swp;
+    }
 
-    status = sss_key_store_set_key(&g_ks, &derived_b, dummy,
-        sizeof(dummy), sizeof(dummy) * 8, &g_derive_policy,
-        sizeof(g_derive_policy));
-    ASSERT_OK(status, "derived_b pre-create");
-
-    status = sss_derive_key_context_init(&derive_ctx, &g_ctx.session,
-        &key_b, kAlgorithm_SSS_ECDH, kMode_SSS_ComputeSharedSecret);
-    ASSERT_OK(status, "derive_b context_init");
-    status = sss_derive_key_dh(&derive_ctx, &key_a, &derived_b);
-    ASSERT_OK(status, "derive_b dh");
-    sss_derive_key_context_free(&derive_ctx);
-
-    derived_b.cipherType = kSSS_CipherType_AES;
-    status = sss_key_store_get_key(&g_ks, &derived_b,
-        shared_b, &shared_b_len, &shared_bits);
-    ASSERT_OK(status, "get shared_b");
+    (void)id_ss_a;
+    (void)id_ss_b;
 
     /* Shared secrets must be non-zero and equal */
     ASSERT_MEM_NEQ(shared_a, zeros, 32, "shared_a is all zeros");
@@ -1503,12 +1473,8 @@ static void test_x25519_ecdh(void)
     /* Cleanup */
     sss_key_store_erase_key(&g_ks, &key_a);
     sss_key_store_erase_key(&g_ks, &key_b);
-    sss_key_store_erase_key(&g_ks, &derived_a);
-    sss_key_store_erase_key(&g_ks, &derived_b);
     sss_key_object_free(&key_a);
     sss_key_object_free(&key_b);
-    sss_key_object_free(&derived_a);
-    sss_key_object_free(&derived_b);
     TEST_PASS();
 }
 

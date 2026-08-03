@@ -34,11 +34,12 @@ pub fn handle_write(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse 
     }
 }
 
-/// Handle READ commands for objects. ReadObject enforces the read
-/// policy on HMACKey objects (all real applet generations do, verified
-/// on SE050C applet 3.1.1 hardware); size/list/type reads are
-/// unaffected. Real applets guard AESKey objects the same way, but the
-/// simulator does not model that yet.
+/// Handle READ commands for objects. ReadObject always refuses HMACKey
+/// objects, as every real applet generation does regardless of any
+/// attached read policy (verified on SE051 applet 7.2.0 and SE050C
+/// applet 3.1.1 hardware); size/list/type reads are unaffected. Real
+/// applets guard AESKey objects the same way, but the simulator does
+/// not model that yet.
 pub fn handle_read(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
     match apdu.p2 {
         P2_DEFAULT => handle_read_object(apdu, store),
@@ -242,24 +243,16 @@ fn handle_read_object(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespons
                 SecureObject::AESKey { key } => key.clone(),
                 SecureObject::UserID { value } => value.clone(),
                 SecureObject::Counter { value } => value.to_be_bytes().to_vec(),
-                SecureObject::HMACKey { key, policy } => {
-                    // The applet refuses to export an HMACKey object
-                    // unless the policy attached at creation grants
-                    // POLICY_OBJ_ALLOW_READ; an object created with no
-                    // policy attached is not readable. This holds on every
-                    // real applet generation (observed on applet 3.1.1
-                    // SE050C hardware and applet 7.2 parts alike), so it
-                    // is enforced unconditionally, unlike the strict-mode
-                    // ECDH InObject target contract. Real applets guard
-                    // AESKey objects the same way; the simulator does not
-                    // model that yet since no tracked policy exists on
-                    // AESKey objects.
-                    if policy.map_or(true,
-                        |p| p & crate::policy::POLICY_OBJ_ALLOW_READ == 0)
-                    {
-                        return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
-                    }
-                    key.clone()
+                SecureObject::HMACKey { .. } => {
+                    // The applet never exports an HMACKey object, not even
+                    // with POLICY_OBJ_ALLOW_READ attached at creation:
+                    // verified on SE051 applet 7.2.0 hardware, where
+                    // ReadObject fails with SW 0x6986 although the object
+                    // attributes confirm the read policy, and observed
+                    // identically on SE050C applet 3.1.1. Real applets
+                    // guard AESKey objects the same way; the simulator
+                    // does not model that yet.
+                    return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
                 }
             };
             ApduResponse::success_with_tlvs(&[Tlv::new(TAG_1, &data)])
@@ -410,18 +403,17 @@ mod read_policy_tests {
     }
 
     #[test]
-    fn test_read_hmackey_with_read_policy_succeeds() {
-        let key = vec![0xABu8; 32];
+    fn test_read_hmackey_with_read_policy_still_denied() {
+        // Hardware ground truth (SE051 applet 7.2.0): even an attached
+        // POLICY_OBJ_ALLOW_READ does not make an HMACKey object readable.
         let mut store = ObjectStore::new();
         store.insert([0, 0, 0, 0x66],
             SecureObject::HMACKey {
-                key: key.clone(),
+                key: vec![0xAB; 32],
                 policy: Some(POLICY_OBJ_ALLOW_READ | 0x0014_0000),
             });
         let resp = handle_read(&read_apdu([0, 0, 0, 0x66]), &mut store);
-        assert_eq!(resp.sw, 0x9000);
-        let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
-        assert_eq!(tlv::find_tlv(&tlvs, TAG_1).unwrap().value, key);
+        assert_eq!(resp.sw, SW_COMMAND_NOT_ALLOWED);
     }
 
     #[test]
