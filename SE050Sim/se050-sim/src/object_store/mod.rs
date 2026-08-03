@@ -263,13 +263,27 @@ impl Default for ObjectStore {
 mod persistence_tests {
     use super::*;
 
+    /// Unique per-invocation store path so concurrent `cargo test`
+    /// processes cannot interfere through a shared temp file.
+    fn unique_store_path(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        std::env::temp_dir().join(format!(
+            "se050_sim_{}_{}_{}.json",
+            tag,
+            std::process::id(),
+            nanos
+        ))
+    }
+
     #[test]
     fn test_legacy_flat_store_file_still_loads() {
         // Pre-curve-state store files are a flat hex-id -> object map;
         // they must keep loading (with the default curve set) so
         // existing on-disk stores survive the schema change.
-        let dir = std::env::temp_dir();
-        let path = dir.join("se050_sim_legacy_store_test.json");
+        let path = unique_store_path("legacy_store_test");
         let legacy = r#"{
             "00000042": { "Binary": { "data": [1, 2, 3] } }
         }"#;
@@ -286,9 +300,7 @@ mod persistence_tests {
 
     #[test]
     fn test_curve_state_round_trips_through_persistence() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("se050_sim_curve_store_test.json");
-        let _ = std::fs::remove_file(&path);
+        let path = unique_store_path("curve_store_test");
         {
             let mut store = ObjectStore::with_persistence(path.clone());
             store.curve_delete(0x01);

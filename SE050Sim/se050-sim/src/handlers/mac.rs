@@ -176,10 +176,15 @@ pub fn handle_init(apdu: &ParsedApdu, store: &mut ObjectStore, validate: bool) -
         _ => return ApduResponse::error(SW_WRONG_DATA),
     };
     // The crypto object must have been created first; ops on a
-    // never-created crypto object fail 0x6985 on real applets.
-    let Some(&(_, subtype)) = store.crypto_object_types.get(&crypto_id) else {
+    // never-created crypto object fail 0x6985 on real applets. MAC
+    // contexts are created with kSE05x_CryptoContext_SIGNATURE (0x03)
+    // by the SDK; refuse digest/cipher objects like their handlers do.
+    let Some(&(context, subtype)) = store.crypto_object_types.get(&crypto_id) else {
         return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
     };
+    if context != 0x03 {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
     if !store.exists(&key_id) {
         return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
     }
@@ -411,6 +416,25 @@ mod tests {
         let mut body = vec![TAG_1, 0x04];
         body.extend_from_slice(&key_id);
         body.extend_from_slice(&[TAG_2, 0x02, 0x07, 0x77]);
+        let init = ParsedApdu {
+            cla: 0x80, ins: INS_CRYPTO, p1: P1_MAC, p2: P2_GENERATE, data: body, le: None,
+        };
+        assert_eq!(handle_init(&init, &mut store, false).sw, SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn test_mac_init_rejects_non_signature_context_object() {
+        // A crypto object created with the DIGEST context (0x01) must
+        // not be usable as a MAC context; the SDK creates MAC contexts
+        // with kSE05x_CryptoContext_SIGNATURE (0x03).
+        let key_id = [0, 0, 0, 0x76];
+        let crypto_id = 0x0031u16;
+        let mut store = ObjectStore::new();
+        store.insert(key_id, SecureObject::HMACKey { key: HMAC_KEY.to_vec(), policy: None });
+        store.crypto_object_types.insert(crypto_id, (0x01, 0x04)); // DIGEST/SHA256
+        let mut body = vec![TAG_1, 0x04];
+        body.extend_from_slice(&key_id);
+        body.extend_from_slice(&[TAG_2, 0x02, 0x00, 0x31]);
         let init = ParsedApdu {
             cla: 0x80, ins: INS_CRYPTO, p1: P1_MAC, p2: P2_GENERATE, data: body, le: None,
         };
