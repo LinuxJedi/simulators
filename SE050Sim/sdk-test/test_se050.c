@@ -332,7 +332,7 @@ static void test_ecdh(const char *name, uint32_t obj_a, uint32_t obj_b,
     size_t shared_len = sizeof(shared);
     uint8_t pub_b[256];
     size_t pub_b_len = sizeof(pub_b);
-    size_t pub_b_bits = sizeof(pub_b) * 8;
+    size_t pub_b_bits = 0;
     size_t point_len;
     smStatus_t sm;
 
@@ -369,13 +369,11 @@ static void test_ecdh(const char *name, uint32_t obj_a, uint32_t obj_b,
     point_len = (size_t)(1 + 2 * key_bytes);
     if (pub_b_len < point_len || pub_b[pub_b_len - point_len] != 0x04) {
         TEST_FAIL("key_b public point not found");
-        return;
     }
     sm = Se05x_API_ECDHGenerateSharedSecret(&g_session->s_ctx, obj_a,
         pub_b + pub_b_len - point_len, point_len, shared, &shared_len);
     if (sm != SM_OK) {
         TEST_FAILF("direct ECDH failed: 0x%04x", (unsigned)sm);
-        return;
     }
     ASSERT_EQ(shared_len, (size_t)key_bytes, "shared secret length");
 
@@ -1424,11 +1422,11 @@ static void test_x25519_ecdh(void)
      * applet speaks big endian for Montgomery keys, so the peer point
      * and the returned secret are byte swapped around each call. */
     pub_len = sizeof(pub_der);
-    pub_bits = sizeof(pub_der) * 8;
+    pub_bits = 0;
     status = sss_key_store_get_key(&g_ks, &key_b,
         pub_der, &pub_len, &pub_bits);
     ASSERT_OK(status, "get key_b public");
-    if (pub_len < 32) { TEST_FAIL("key_b public too short"); return; }
+    if (pub_len < 32) { TEST_FAIL("key_b public too short"); }
     memcpy(point, pub_der + pub_len - 32, 32);
     for (i = 0; i < 16; i++) {
         swp = point[i]; point[i] = point[31 - i]; point[31 - i] = swp;
@@ -1437,7 +1435,6 @@ static void test_x25519_ecdh(void)
         point, sizeof(point), shared_a, &shared_a_len);
     if (sm != SM_OK) {
         TEST_FAILF("direct ECDH a failed: 0x%04x", (unsigned)sm);
-        return;
     }
     for (i = 0; i < 16; i++) {
         swp = shared_a[i]; shared_a[i] = shared_a[31 - i];
@@ -1446,11 +1443,11 @@ static void test_x25519_ecdh(void)
 
     /* ECDH(B_priv, A_pub) */
     pub_len = sizeof(pub_der);
-    pub_bits = sizeof(pub_der) * 8;
+    pub_bits = 0;
     status = sss_key_store_get_key(&g_ks, &key_a,
         pub_der, &pub_len, &pub_bits);
     ASSERT_OK(status, "get key_a public");
-    if (pub_len < 32) { TEST_FAIL("key_a public too short"); return; }
+    if (pub_len < 32) { TEST_FAIL("key_a public too short"); }
     memcpy(point, pub_der + pub_len - 32, 32);
     for (i = 0; i < 16; i++) {
         swp = point[i]; point[i] = point[31 - i]; point[31 - i] = swp;
@@ -1459,7 +1456,6 @@ static void test_x25519_ecdh(void)
         point, sizeof(point), shared_b, &shared_b_len);
     if (sm != SM_OK) {
         TEST_FAILF("direct ECDH b failed: 0x%04x", (unsigned)sm);
-        return;
     }
     for (i = 0; i < 16; i++) {
         swp = shared_b[i]; shared_b[i] = shared_b[31 - i];

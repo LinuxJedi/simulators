@@ -796,9 +796,12 @@ mod tests {
         // alike. This is how hosts on applet >= 7.2 obtain the secret.
         for strict in [true, false] {
             let (mut apdu, mut store, expected) = ecdh_inobject_fixture();
-            // Rebuild the request without the Tag7 TLV.
+            // Rebuild the request without the Tag7 TLV, extracting the
+            // peer public key by TLV parsing rather than fixed offsets.
+            let orig = crate::tlv::parse_tlvs(&apdu.data).unwrap();
+            let peer = tlv::find_tlv(&orig, TAG_2).unwrap().value.clone();
             let mut data = tlv_bytes(TAG_1, &[0, 0, 0, 0x64]);
-            data.extend(tlv_bytes(TAG_2, &apdu.data[8..8 + 65]));
+            data.extend(tlv_bytes(TAG_2, &peer));
             apdu.data = data;
             let count_before = store.count();
             let resp = handle_ecdh(&apdu, &mut store, strict);
