@@ -84,8 +84,9 @@ pub fn handle_write_aes_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduR
 /// Handle WRITE HMAC key command (WriteSymmKey with P1=HMAC).
 /// Policy(opt), Tag1=obj_id(4B), Tag3=key_data. HMAC keys have no fixed
 /// length, so any non-empty Tag3 value is accepted as-is. An attached
-/// policy is recorded with the object; the applet 7.2 read-policy
-/// contract (see handle_read_object) keys off it.
+/// policy is validated and recorded with the object (it is part of the
+/// object's attributes on a real applet); note it cannot make the
+/// object readable (see object_mgmt::handle_read).
 pub fn handle_write_hmac_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,

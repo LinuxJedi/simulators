@@ -112,8 +112,9 @@ pub enum SecureObject {
         key: Vec<u8>,
         /// Union of the AR headers from the TAG_POLICY TLV attached at
         /// creation; None when the object was created with no policy.
-        /// The applet 7.2 read-policy contract keys off this (see
-        /// crate::policy).
+        /// Kept as part of the object's attributes; note ReadObject
+        /// refuses HMACKey objects regardless of this value, as real
+        /// applets do (see crate::policy and object_mgmt::handle_read).
         #[serde(default)]
         policy: Option<u32>,
     },
