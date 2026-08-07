@@ -60,15 +60,28 @@ pub enum AppletVersion {
 
 impl AppletVersion {
     /// Read the personality from the SE050_SIM_APPLET environment
-    /// variable. Accepts "3", "3.1.1" (SE050C); "e", "se050e", "7.2.0e"
-    /// (SE050E, any value ending in "e"); and "7", "7.2", "7.2.0"
-    /// (SE051). Unset or unrecognized values select 7.2.0, matching the
-    /// version the simulator has always advertised.
+    /// variable. Unset selects 7.2.0, matching the version the
+    /// simulator has always advertised; see `from_token` for the
+    /// accepted values.
     pub fn from_env() -> Self {
         match std::env::var("SE050_SIM_APPLET") {
-            Ok(v) if v.starts_with('3') => AppletVersion::V3_1_1,
-            Ok(v) if v.to_ascii_lowercase().ends_with('e') => AppletVersion::V7_2_0E,
-            _ => AppletVersion::V7_2_0,
+            Ok(v) => Self::from_token(&v),
+            Err(_) => AppletVersion::V7_2_0,
+        }
+    }
+
+    /// Parse a personality token. Accepts "e", "se050e", "7.2.0e" --
+    /// any value ending in "e" or "E" -- for the SE050E; "3", "3.1.1"
+    /// for the SE050C; and anything else ("7", "7.2", "7.2.0",
+    /// unrecognized) for the SE051.
+    pub fn from_token(token: &str) -> Self {
+        let t = token.trim().to_ascii_lowercase();
+        if t.ends_with('e') {
+            AppletVersion::V7_2_0E
+        } else if t.starts_with('3') {
+            AppletVersion::V3_1_1
+        } else {
+            AppletVersion::V7_2_0
         }
     }
 
@@ -104,6 +117,15 @@ impl AppletVersion {
         !matches!(self, AppletVersion::V7_2_0E)
     }
 
+    /// Whether this is a 7.2-generation applet (SE051 or SE050E).
+    /// Gates the 7.2-specific read behaviors: curve-specific ReadType
+    /// codes and ReadObjectAttributes support. Bench-verified: the
+    /// SE050E reports the same curve-specific type codes as the SE051
+    /// (P-256 pair 0x29, P-521 pair 0x31).
+    pub fn is_v7(self) -> bool {
+        !matches!(self, AppletVersion::V3_1_1)
+    }
+
     /// GetFreeMemory reply for a memory type, as measured on the bench
     /// parts. All three parts reply with a 2-byte big-endian value; the
     /// SE050E reports PERSISTENT clamped at 0x7FFF. (An earlier revision
@@ -132,24 +154,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_from_env_tokens() {
-        // Tests run single-threaded (see CLAUDE.md), so mutating the
-        // process environment here cannot race another test.
+    fn test_from_token_mapping() {
         for (token, expected) in [
             ("3", AppletVersion::V3_1_1),
             ("3.1.1", AppletVersion::V3_1_1),
+            ("7", AppletVersion::V7_2_0),
             ("7.2.0", AppletVersion::V7_2_0),
             ("e", AppletVersion::V7_2_0E),
             ("E", AppletVersion::V7_2_0E),
             ("se050e", AppletVersion::V7_2_0E),
+            ("SE050E", AppletVersion::V7_2_0E),
             ("7.2.0e", AppletVersion::V7_2_0E),
+            // The ending-in-e rule takes precedence over the leading-3
+            // rule, matching the documented behavior.
+            ("3e", AppletVersion::V7_2_0E),
+            (" se050e ", AppletVersion::V7_2_0E),
             ("bogus", AppletVersion::V7_2_0),
+            ("", AppletVersion::V7_2_0),
         ] {
-            std::env::set_var("SE050_SIM_APPLET", token);
-            assert_eq!(AppletVersion::from_env(), expected, "token {:?}", token);
+            assert_eq!(AppletVersion::from_token(token), expected,
+                       "token {:?}", token);
         }
-        std::env::remove_var("SE050_SIM_APPLET");
-        assert_eq!(AppletVersion::from_env(), AppletVersion::V7_2_0);
     }
 
     #[test]
@@ -157,6 +182,11 @@ mod tests {
         assert!(AppletVersion::V3_1_1.supports_rsa());
         assert!(AppletVersion::V7_2_0.supports_rsa());
         assert!(!AppletVersion::V7_2_0E.supports_rsa());
+        // The SE050E is a 7.2-generation part: it must get the
+        // curve-specific ReadType codes, not the 3.x generic ones.
+        assert!(!AppletVersion::V3_1_1.is_v7());
+        assert!(AppletVersion::V7_2_0.is_v7());
+        assert!(AppletVersion::V7_2_0E.is_v7());
         // All personalities reply GetFreeMemory as 2-byte values.
         for v in [
             AppletVersion::V3_1_1,
