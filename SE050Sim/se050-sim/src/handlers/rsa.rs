@@ -50,12 +50,31 @@ const TAG_RSA_PUB_MOD: u8 = 0x4A; // TAG_10
 ///   simulator accumulates components in `RSAKeyPair::staged` and materializes
 ///   a PKCS#1 DER once the set is sufficient (N+E+D, or CRT primes+E+N).
 ///
-/// P1 = `P1_RSA | key_part`, P2 = `rsa_format`. Tags 3–10 per the map above.
-pub fn handle_write_rsa_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
+/// P1 = `P1_RSA | key_part`, P2 = `rsa_format`. Tags 3-10 per the map above.
+///
+/// On a personality without RSA support (SE050E) the applet refuses
+/// keygen with SW 0x6985 and any APDU carrying key material with SW
+/// 0x6A80 (both bench-verified on real SE050E silicon).
+pub fn handle_write_rsa_key(
+    apdu: &ParsedApdu,
+    store: &mut ObjectStore,
+    version: crate::applet::AppletVersion,
+) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
         Err(_) => return ApduResponse::error(SW_WRONG_DATA),
     };
+
+    if !version.supports_rsa() {
+        let has_component = tlvs.iter().any(|t| {
+            (TAG_RSA_P..=TAG_RSA_PUB_MOD).contains(&t.tag)
+        });
+        return ApduResponse::error(if has_component {
+            SW_WRONG_DATA
+        } else {
+            SW_CONDITIONS_NOT_SATISFIED
+        });
+    }
 
     let obj_id = match tlv::find_tlv(&tlvs, TAG_1) {
         Some(t) if t.value.len() == 4 => {
@@ -535,5 +554,52 @@ mod tests {
             .decrypt(Pkcs1v15Encrypt, &tlvs[0].value)
             .expect("decrypt");
         assert_eq!(recovered, plaintext);
+    }
+
+    fn write_rsa_apdu(data: Vec<u8>) -> crate::apdu::ParsedApdu {
+        crate::apdu::ParsedApdu {
+            cla: 0x80,
+            ins: crate::apdu::INS_WRITE,
+            p1: crate::apdu::P1_RSA,
+            p2: crate::apdu::P2_DEFAULT,
+            data,
+            le: None,
+        }
+    }
+
+    #[test]
+    fn se050e_refuses_rsa_keygen_and_import() {
+        // Bench-verified on real SE050E silicon: keygen (size-only
+        // APDU) refuses 0x6985; any APDU carrying key material
+        // refuses 0x6A80. The SE051 personality still serves both.
+        use crate::applet::AppletVersion;
+        let mut store = ObjectStore::new();
+        let obj_id = [0x7Fu8, 0x40, 0x00, 0x01];
+
+        let mut keygen = Vec::new();
+        keygen.extend_from_slice(&Tlv::new(TAG_1, &obj_id).encode());
+        keygen.extend_from_slice(&Tlv::new(TAG_2, &2048u16.to_be_bytes()).encode());
+        let resp = handle_write_rsa_key(
+            &write_rsa_apdu(keygen), &mut store, AppletVersion::V7_2_0E);
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert!(!store.exists(&obj_id));
+
+        let mut import = Vec::new();
+        import.extend_from_slice(&Tlv::new(TAG_1, &obj_id).encode());
+        import.extend_from_slice(&Tlv::new(TAG_2, &2048u16.to_be_bytes()).encode());
+        import.extend_from_slice(&Tlv::new(TAG_RSA_PUB_EXP, &[0x01, 0x00, 0x01]).encode());
+        import.extend_from_slice(&Tlv::new(TAG_RSA_PUB_MOD, &[0xB1; 256]).encode());
+        let resp = handle_write_rsa_key(
+            &write_rsa_apdu(import), &mut store, AppletVersion::V7_2_0E);
+        assert_eq!(resp.sw, SW_WRONG_DATA);
+        assert!(!store.exists(&obj_id));
+
+        let mut keygen_1k = Vec::new();
+        keygen_1k.extend_from_slice(&Tlv::new(TAG_1, &obj_id).encode());
+        keygen_1k.extend_from_slice(&Tlv::new(TAG_2, &1024u16.to_be_bytes()).encode());
+        let resp = handle_write_rsa_key(
+            &write_rsa_apdu(keygen_1k), &mut store, AppletVersion::V7_2_0);
+        assert_eq!(resp.sw, 0x9000, "SE051 personality keeps RSA keygen");
+        assert!(store.exists(&obj_id));
     }
 }

@@ -42,10 +42,9 @@ fn handle_get_version(version: AppletVersion) -> ApduResponse {
     ApduResponse::success_with_tlvs(&[Tlv::new(TAG_1, &version.version_bytes())])
 }
 
-/// GetFreeMemory: Tag1 = memory type (1B). The response width is
-/// applet-dependent: 2 bytes on 3.x, 4 bytes on 7.2 (the v04.07.01
-/// middleware parses U16 vs U32 accordingly); values as measured on
-/// the bench parts.
+/// GetFreeMemory: Tag1 = memory type (1B). All bench parts (3.1.1,
+/// 7.2.0, SE050E) reply with a 2-byte value; per-type values as
+/// measured on the bench parts (see AppletVersion::free_memory_bytes).
 fn handle_get_free_memory(apdu: &ParsedApdu, version: AppletVersion) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
@@ -62,8 +61,8 @@ fn handle_get_free_memory(apdu: &ParsedApdu, version: AppletVersion) -> ApduResp
 
 /// GetRandom: reads TLV[Tag1] as 2-byte requested length, returns
 /// random bytes. Zero-length requests fail 0x6985 and there is a
-/// per-applet maximum (880 bytes on 3.1.1, 1018 on 7.2.0), both
-/// bench-verified.
+/// per-applet maximum (880 bytes on 3.1.1, 1018 on 7.2.0 and the
+/// SE050E), all bench-verified.
 fn handle_get_random(apdu: &ParsedApdu, version: AppletVersion) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
@@ -115,12 +114,14 @@ mod tests {
 
     #[test]
     fn test_get_random_bounds_per_version() {
-        // Bench-verified: size 0 fails on both parts; the cap is 880
-        // on the SE050C (3.1.1) and 1018 on the SE051 (7.2.0).
+        // Bench-verified: size 0 fails on all parts; the cap is 880
+        // on the SE050C (3.1.1) and 1018 on the SE051 (7.2.0) and
+        // SE050E.
         let mut store = ObjectStore::new();
         for (version, max) in [
             (AppletVersion::V3_1_1, 880u16),
             (AppletVersion::V7_2_0, 1018u16),
+            (AppletVersion::V7_2_0E, 1018u16),
         ] {
             let resp = handle(&random_apdu(0), &mut store, version);
             assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
@@ -136,7 +137,8 @@ mod tests {
     #[test]
     fn test_get_version_per_applet() {
         // Bench-captured blobs: SE050C 3.1.1 -> 03 01 01 6f ff 01 0b,
-        // SE051 7.2.0 -> 07 02 00 3f ff ff ff.
+        // SE051 7.2.0 -> 07 02 00 3f ff ff ff, SE050E 7.2.0 ->
+        // 07 02 00 3f 9f ff ff (appletConfig without the RSA bits).
         let mut store = ObjectStore::new();
         let apdu = ParsedApdu {
             cla: 0x80, ins: INS_MGMT, p1: P1_DEFAULT, p2: P2_VERSION,
@@ -148,23 +150,36 @@ mod tests {
         let resp = handle(&apdu, &mut store, AppletVersion::V7_2_0);
         let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
         assert_eq!(tlvs[0].value, [0x07, 0x02, 0x00, 0x3F, 0xFF, 0xFF, 0xFF]);
+        let resp = handle(&apdu, &mut store, AppletVersion::V7_2_0E);
+        let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
+        assert_eq!(tlvs[0].value, [0x07, 0x02, 0x00, 0x3F, 0x9F, 0xFF, 0xFF]);
     }
 
     #[test]
-    fn test_get_free_memory_width_per_applet() {
-        // 3.x replies U16, 7.2 replies U32 (middleware parses per
-        // version); values as measured on the bench parts.
+    fn test_get_free_memory_values_per_applet() {
+        // All bench parts reply with a 2-byte value; per-type values
+        // as measured on the bench (SE050E clamps PERSISTENT at
+        // 0x7FFF). The v04.07.01 middleware rejects TLV values longer
+        // than 2 bytes for these applets (tlvGet_U16), so a 4-byte
+        // reply would make Se05x_API_GetFreeMemory fail host-side.
         let mut store = ObjectStore::new();
-        let apdu = ParsedApdu {
-            cla: 0x80, ins: INS_MGMT, p1: P1_DEFAULT, p2: P2_MEMORY,
-            data: vec![TAG_1, 0x01, 0x01], le: None,
-        };
-        let resp = handle(&apdu, &mut store, AppletVersion::V3_1_1);
-        let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
-        assert_eq!(tlvs[0].value.len(), 2);
-        assert_eq!(u16::from_be_bytes([tlvs[0].value[0], tlvs[0].value[1]]), 31304);
-        let resp = handle(&apdu, &mut store, AppletVersion::V7_2_0);
-        let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
-        assert_eq!(tlvs[0].value.len(), 4);
+        for (version, persistent) in [
+            (AppletVersion::V3_1_1, 31304u16),
+            (AppletVersion::V7_2_0, 21000u16),
+            (AppletVersion::V7_2_0E, 32767u16),
+        ] {
+            let apdu = ParsedApdu {
+                cla: 0x80, ins: INS_MGMT, p1: P1_DEFAULT, p2: P2_MEMORY,
+                data: vec![TAG_1, 0x01, 0x01], le: None,
+            };
+            let resp = handle(&apdu, &mut store, version);
+            let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
+            assert_eq!(tlvs[0].value.len(), 2, "{:?}", version);
+            assert_eq!(
+                u16::from_be_bytes([tlvs[0].value[0], tlvs[0].value[1]]),
+                persistent,
+                "{:?}", version
+            );
+        }
     }
 }

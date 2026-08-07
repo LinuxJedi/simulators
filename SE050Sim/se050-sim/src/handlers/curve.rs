@@ -70,9 +70,11 @@ pub fn handle_create(
     }
     if store.curve_exists(curve_id) {
         return match version {
-            // Bench-verified on the SE051: re-creating an existing
-            // curve is refused and the curve is left intact.
-            AppletVersion::V7_2_0 => ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
+            // Bench-verified on the SE051 and SE050E: re-creating an
+            // existing curve is refused and the curve is left intact.
+            AppletVersion::V7_2_0 | AppletVersion::V7_2_0E => {
+                ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED)
+            }
             // Bench-verified on the SE050C: the duplicate create is
             // accepted and resets the curve to param-less, so key
             // generation on it fails until the parameters are

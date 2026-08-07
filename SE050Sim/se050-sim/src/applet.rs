@@ -21,23 +21,31 @@
 
 /// Applet personality selection.
 ///
-/// The simulator can present itself as either of the two applet
-/// generations that were bench-characterized on real silicon (August
-/// 2026, see SE050Sim/HARDWARE_VALIDATION.md): an SE050C running applet
-/// 3.1.1 or an SE051 running applet 7.2.0. Almost all behavior is
-/// identical between the two; the differences the simulator models are:
+/// The simulator can present itself as any of the three parts that were
+/// bench-characterized on real silicon (August 2026, see
+/// SE050Sim/HARDWARE_VALIDATION.md): an SE050C running applet 3.1.1, an
+/// SE051 running applet 7.2.0, or an SE050E running applet 7.2.0 with
+/// the RSA feature bits disabled. Almost all behavior is identical
+/// across the three; the differences the simulator models are:
 ///
-/// * SELECT / GetVersion version bytes.
-/// * GetFreeMemory response width (2 bytes on 3.x, 4 bytes on 7.2) and
-///   the reported per-type values.
+/// * SELECT / GetVersion version bytes (the SE050E's appletConfig word
+///   clears the RSA_PLAIN and RSA_CRT bits: 0x3f9f vs the SE051's
+///   0x3fff).
+/// * GetFreeMemory per-type values. All three parts reply with a 2-byte
+///   value (the SE050E clamps PERSISTENT at 0x7FFF); the v04.07.01
+///   middleware parses U16 for every applet below minor version 0x10
+///   and U32 only for the SE052F family.
 /// * GetRandom maximum request size (880 bytes on the SE050C, 1018 on
-///   the SE051).
+///   the SE051 and SE050E).
 /// * ReadType secure-object type codes for EC keys (generic 0x01/0x03
 ///   on 3.x, curve-specific on 7.2).
 /// * CreateECCurve on an already existing curve: applet 7.2 refuses
 ///   with SW 0x6985; applet 3.1.1 returns 0x9000 and silently resets
 ///   the curve to a parameter-less state (subsequent key generation on
 ///   it fails 0x6985 until the parameters are uploaded again).
+/// * RSA: the SE050E refuses key generation with SW 0x6985 and key
+///   import with SW 0x6A80; wolfSSL's wolfcrypt suite consequently
+///   fails its RSA test with WC_HW_E against real SE050E silicon.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppletVersion {
@@ -45,16 +53,21 @@ pub enum AppletVersion {
     V3_1_1,
     /// SE051, applet 7.2.0 (ATR historical bytes "eSE051"). Default.
     V7_2_0,
+    /// SE050E, applet 7.2.0 with RSA disabled in appletConfig (ATR
+    /// historical bytes also read "eSE051" on real parts).
+    V7_2_0E,
 }
 
 impl AppletVersion {
     /// Read the personality from the SE050_SIM_APPLET environment
-    /// variable. Accepts "3", "3.1.1" (SE050C) and "7", "7.2", "7.2.0"
+    /// variable. Accepts "3", "3.1.1" (SE050C); "e", "se050e", "7.2.0e"
+    /// (SE050E, any value ending in "e"); and "7", "7.2", "7.2.0"
     /// (SE051). Unset or unrecognized values select 7.2.0, matching the
     /// version the simulator has always advertised.
     pub fn from_env() -> Self {
         match std::env::var("SE050_SIM_APPLET") {
             Ok(v) if v.starts_with('3') => AppletVersion::V3_1_1,
+            Ok(v) if v.to_ascii_lowercase().ends_with('e') => AppletVersion::V7_2_0E,
             _ => AppletVersion::V7_2_0,
         }
     }
@@ -63,32 +76,46 @@ impl AppletVersion {
     /// major, minor, patch, appletConfig (2B), secureBox (2B).
     /// Captured from real parts: SE050C applet 3.1.1 returns
     /// 03 01 01 6f ff 01 0b, SE051 applet 7.2.0 returns
-    /// 07 02 00 3f ff ff ff.
+    /// 07 02 00 3f ff ff ff, SE050E applet 7.2.0 returns
+    /// 07 02 00 3f 9f ff ff (appletConfig clears RSA_PLAIN 0x0020
+    /// and RSA_CRT 0x0040).
     pub fn version_bytes(self) -> [u8; 7] {
         match self {
             AppletVersion::V3_1_1 => [0x03, 0x01, 0x01, 0x6F, 0xFF, 0x01, 0x0B],
             AppletVersion::V7_2_0 => [0x07, 0x02, 0x00, 0x3F, 0xFF, 0xFF, 0xFF],
+            AppletVersion::V7_2_0E => [0x07, 0x02, 0x00, 0x3F, 0x9F, 0xFF, 0xFF],
         }
     }
 
     /// Largest GetRandom request the applet serves; one byte more
     /// returns SW 0x6985 (bench-measured: 880 on SE050C 3.1.1, 1018 on
-    /// SE051 7.2.0).
+    /// SE051 7.2.0 and SE050E).
     pub fn get_random_max(self) -> usize {
         match self {
             AppletVersion::V3_1_1 => 880,
-            AppletVersion::V7_2_0 => 1018,
+            AppletVersion::V7_2_0 | AppletVersion::V7_2_0E => 1018,
         }
     }
 
+    /// Whether the applet supports RSA at all. The SE050E's applet
+    /// build has the RSA_PLAIN / RSA_CRT feature bits cleared
+    /// (bench-verified: keygen refuses 0x6985, import refuses 0x6A80).
+    pub fn supports_rsa(self) -> bool {
+        !matches!(self, AppletVersion::V7_2_0E)
+    }
+
     /// GetFreeMemory reply for a memory type, as measured on the bench
-    /// parts. Applet 3.x replies with a 2-byte value, 7.2 with 4 bytes
-    /// (the v04.07.01 middleware parses U16 vs U32 accordingly).
+    /// parts. All three parts reply with a 2-byte big-endian value; the
+    /// SE050E reports PERSISTENT clamped at 0x7FFF. (An earlier revision
+    /// emitted 4 bytes for 7.2.0 after misreading the middleware's
+    /// SE052F-only U32 parse path; the v04.07.01 middleware rejects
+    /// TLV values longer than 2 bytes for these applets.)
     pub fn free_memory_bytes(self, memory_type: u8) -> Option<Vec<u8>> {
-        let (persistent, transient_reset, transient_deselect): (u32, u32, u32) =
+        let (persistent, transient_reset, transient_deselect): (u16, u16, u16) =
             match self {
                 AppletVersion::V3_1_1 => (31304, 575, 560),
                 AppletVersion::V7_2_0 => (21000, 605, 592),
+                AppletVersion::V7_2_0E => (32767, 796, 784),
             };
         let value = match memory_type {
             0x01 => persistent,
@@ -96,9 +123,50 @@ impl AppletVersion {
             0x03 => transient_deselect,
             _ => return None,
         };
-        Some(match self {
-            AppletVersion::V3_1_1 => (value as u16).to_be_bytes().to_vec(),
-            AppletVersion::V7_2_0 => value.to_be_bytes().to_vec(),
-        })
+        Some(value.to_be_bytes().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_from_env_tokens() {
+        // Tests run single-threaded (see CLAUDE.md), so mutating the
+        // process environment here cannot race another test.
+        for (token, expected) in [
+            ("3", AppletVersion::V3_1_1),
+            ("3.1.1", AppletVersion::V3_1_1),
+            ("7.2.0", AppletVersion::V7_2_0),
+            ("e", AppletVersion::V7_2_0E),
+            ("E", AppletVersion::V7_2_0E),
+            ("se050e", AppletVersion::V7_2_0E),
+            ("7.2.0e", AppletVersion::V7_2_0E),
+            ("bogus", AppletVersion::V7_2_0),
+        ] {
+            std::env::set_var("SE050_SIM_APPLET", token);
+            assert_eq!(AppletVersion::from_env(), expected, "token {:?}", token);
+        }
+        std::env::remove_var("SE050_SIM_APPLET");
+        assert_eq!(AppletVersion::from_env(), AppletVersion::V7_2_0);
+    }
+
+    #[test]
+    fn test_personality_traits() {
+        assert!(AppletVersion::V3_1_1.supports_rsa());
+        assert!(AppletVersion::V7_2_0.supports_rsa());
+        assert!(!AppletVersion::V7_2_0E.supports_rsa());
+        // All personalities reply GetFreeMemory as 2-byte values.
+        for v in [
+            AppletVersion::V3_1_1,
+            AppletVersion::V7_2_0,
+            AppletVersion::V7_2_0E,
+        ] {
+            for mem_type in [0x01u8, 0x02, 0x03] {
+                assert_eq!(v.free_memory_bytes(mem_type).unwrap().len(), 2);
+            }
+            assert!(v.free_memory_bytes(0x04).is_none());
+        }
     }
 }
