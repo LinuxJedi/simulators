@@ -38,8 +38,10 @@ FILE(GLOB EX_SOURCES
 )
 # Platform SCP03: ex_sss_se05x_auth.c references scp03_keys_from_path() (the
 # EX_SSS_BOOT_SCP03_PATH key-file loader) whenever SCP03 is compiled in on
-# Linux. Gated so Auth=None builds stay byte-identical.
-IF(NOT "${PTMW_SE05X_Auth}" STREQUAL "None")
+# Linux. Gated so Auth=None builds stay byte-identical. The DEFINED check
+# matters because an unset variable would make the STREQUAL test true and pull
+# the SCP03 sources into a plain build.
+IF(DEFINED PTMW_SE05X_Auth AND NOT "${PTMW_SE05X_Auth}" STREQUAL "None")
     LIST(APPEND EX_SOURCES ${SIMW_LIB_DIR}/sss/ex/src/ex_sss_scp03_auth.c)
 ENDIF()
 ADD_LIBRARY(ex_common STATIC ${EX_SOURCES})
@@ -79,8 +81,9 @@ FILE(GLOB SMCOM_SOURCES
 )
 # Platform SCP03 command wrapping (nxScp03_GP_InitializeUpdate /
 # ExternalAuthenticate / Encrypt / Decrypt). The libCommon/nxScp/ directory
-# is not covered by the globs above. Gated so Auth=None builds are unchanged.
-IF(NOT "${PTMW_SE05X_Auth}" STREQUAL "None")
+# is not covered by the globs above. Gated so Auth=None builds are unchanged;
+# see the DEFINED note above.
+IF(DEFINED PTMW_SE05X_Auth AND NOT "${PTMW_SE05X_Auth}" STREQUAL "None")
     LIST(APPEND SMCOM_SOURCES ${SIMW_LIB_DIR}/hostlib/hostLib/libCommon/nxScp/nxScp03_Com.c)
 ENDIF()
 ADD_LIBRARY(smCom STATIC ${SMCOM_SOURCES})

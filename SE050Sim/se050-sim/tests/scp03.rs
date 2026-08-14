@@ -525,6 +525,45 @@ fn bad_host_cryptogram_refused() {
     assert_eq!(resp, vec![0x69, 0x82]);
 }
 
+/// EXTERNAL AUTHENTICATE without a preceding INITIALIZE UPDATE is a sequencing
+/// error, not a MAC failure: it must report 0x6985 rather than falling through
+/// to the wrapped-command path and reporting 0x6982.
+#[test]
+fn external_authenticate_without_initialize_update() {
+    let mut host = T1Host::new();
+    let mut ea = vec![0x84, 0x82, 0x33, 0x00, 0x10];
+    ea.extend_from_slice(&[0u8; 16]);
+    assert_eq!(host.transceive(&ea), vec![0x69, 0x85]);
+
+    // Still recoverable: a full handshake afterwards works.
+    let mut c = open_session(&mut host, &DEF_ENC, &DEF_MAC, 0x33);
+    let (ins, p1, p2, data) = get_random(8);
+    let cmd = c.wrap(ins, p1, p2, &data, Some(0x00));
+    let (_out, sw) = c.unwrap(&host.transceive(&cmd));
+    assert_eq!(sw, 0x9000);
+}
+
+/// A wrapped command whose inner INS is 0x82 must still be treated as a
+/// wrapped command inside an active session, not mistaken for a second
+/// EXTERNAL AUTHENTICATE.
+#[test]
+fn wrapped_command_with_inner_ins_82_is_not_external_authenticate() {
+    let mut host = T1Host::new();
+    let mut c = open_session(&mut host, &DEF_ENC, &DEF_MAC, 0x33);
+
+    // INS 0x82 masks to INS_READ (0x02); P1/P2 here select ReadECCurveList,
+    // so a correctly wrapped command must be dispatched and answered, and the
+    // session must survive.
+    let cmd = c.wrap(0x82, 0x0b, 0x25, &[], Some(0x00));
+    let (_out, sw) = c.unwrap(&host.transceive(&cmd));
+    assert_eq!(sw, 0x9000, "inner INS 0x82 should dispatch as a read");
+
+    let (ins, p1, p2, data) = get_random(8);
+    let cmd = c.wrap(ins, p1, p2, &data, Some(0x00));
+    let (_out, sw) = c.unwrap(&host.transceive(&cmd));
+    assert_eq!(sw, 0x9000, "session should still be alive");
+}
+
 #[test]
 fn soft_reset_and_resync_drop_session() {
     for reset_code in [0x0Fu8, 0x00u8] {

@@ -303,8 +303,15 @@ impl T1Responder {
                 };
             }
 
-            // EXTERNAL AUTHENTICATE (CLA 0x84 INS 0x82): only when pending.
-            if cla == 0x84 && ins == 0x82 && self.scp03.is_pending() {
+            // EXTERNAL AUTHENTICATE (CLA 0x84 INS 0x82) completes a handshake
+            // started by INITIALIZE UPDATE. Outside an established session that
+            // is the only thing 84 82 can mean, so route it even when no
+            // handshake is pending: the state machine then answers 0x6985
+            // ("conditions of use not satisfied") instead of it falling through
+            // to the wrapped-command path and being reported as a MAC failure.
+            // Inside an active session it stays a wrapped command, whose
+            // decrypted inner INS may legitimately be 0x82.
+            if cla == 0x84 && ins == 0x82 && !self.scp03.is_active() {
                 return self.scp03.external_authenticate(apdu_bytes);
             }
 
