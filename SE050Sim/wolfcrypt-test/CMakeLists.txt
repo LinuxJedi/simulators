@@ -36,6 +36,12 @@ FILE(GLOB EX_SOURCES
     ${SIMW_LIB_DIR}/sss/ex/src/ex_sss_se05x.c
     ${SIMW_LIB_DIR}/sss/ex/src/ex_sss_se05x_auth.c
 )
+# Platform SCP03: ex_sss_se05x_auth.c references scp03_keys_from_path() (the
+# EX_SSS_BOOT_SCP03_PATH key-file loader) whenever SCP03 is compiled in on
+# Linux. Gated so Auth=None builds stay byte-identical.
+IF(NOT "${PTMW_SE05X_Auth}" STREQUAL "None")
+    LIST(APPEND EX_SOURCES ${SIMW_LIB_DIR}/sss/ex/src/ex_sss_scp03_auth.c)
+ENDIF()
 ADD_LIBRARY(ex_common STATIC ${EX_SOURCES})
 TARGET_INCLUDE_DIRECTORIES(ex_common PUBLIC ${SIMW_INC_DIR})
 SET_TARGET_PROPERTIES(ex_common PROPERTIES ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/sss/ex/src)
@@ -71,6 +77,12 @@ FILE(GLOB SMCOM_SOURCES
     ${SIMW_LIB_DIR}/hostlib/hostLib/libCommon/smCom/T1oI2C/*.c
     ${SIMW_LIB_DIR}/hostlib/hostLib/libCommon/infra/*.c
 )
+# Platform SCP03 command wrapping (nxScp03_GP_InitializeUpdate /
+# ExternalAuthenticate / Encrypt / Decrypt). The libCommon/nxScp/ directory
+# is not covered by the globs above. Gated so Auth=None builds are unchanged.
+IF(NOT "${PTMW_SE05X_Auth}" STREQUAL "None")
+    LIST(APPEND SMCOM_SOURCES ${SIMW_LIB_DIR}/hostlib/hostLib/libCommon/nxScp/nxScp03_Com.c)
+ENDIF()
 ADD_LIBRARY(smCom STATIC ${SMCOM_SOURCES})
 TARGET_INCLUDE_DIRECTORIES(smCom PUBLIC ${SIMW_INC_DIR})
 SET_TARGET_PROPERTIES(smCom PROPERTIES ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/hostlib/hostLib/libCommon)

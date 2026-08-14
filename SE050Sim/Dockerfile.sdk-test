@@ -12,6 +12,11 @@ RUN cd /app/se050-sim && cargo build --release --bin tcp_server 2>&1
 # ============================================================================
 FROM debian:bookworm
 
+# Auth mode for the NXP SDK: "None" (plain, default) or "PlatfSCP03".
+# The SCP03 CI variant is built with --build-arg SE05X_AUTH=PlatfSCP03.
+ARG SE05X_AUTH=None
+ENV SE05X_AUTH=${SE05X_AUTH}
+
 RUN apt-get update && apt-get install -y \
     build-essential cmake git python3 pkg-config \
     libssl-dev \
@@ -21,7 +26,7 @@ COPY --from=sim-builder /app/se050-sim/target/release/tcp_server /app/se050-sim-
 
 # ---- Build NXP Plug&Trust SDK ----
 WORKDIR /app
-RUN git clone --depth 1 https://github.com/NXP/plug-and-trust.git /app/simw-top
+RUN git clone --branch v04.07.01 --depth 1 https://github.com/NXP/plug-and-trust.git /app/simw-top
 
 # Replace PAL I2C with TCP transport and no-op reset
 COPY wolfcrypt-test/i2c_a7.c /app/simw-top/hostlib/hostLib/platform/linux/i2c_a7.c
@@ -43,7 +48,8 @@ RUN mkdir -p /app/simw-top/build && cd /app/simw-top/build && \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_C_FLAGS="-fPIC" \
       -DPTMW_Applet=SE05X_C \
-      -DPTMW_SE05X_Auth=None \
+      -DPTMW_SE05X_Ver=07_02 \
+      -DPTMW_SE05X_Auth=${SE05X_AUTH} \
       -DPTMW_SMCOM=T1oI2C \
       -DPTMW_HostCrypto=OPENSSL \
       -DPTMW_Host=LinuxLike \
@@ -61,7 +67,13 @@ RUN ln -sf /app/simw-top/build/sss/ex/src/libex_common.a /app/simw-top/build/sss
 COPY sdk-test/test_se050.c /app/test_se050.c
 COPY sdk-test/test_helpers.h /app/test_helpers.h
 
+# -DSSS_USE_FTR_FILE is mandatory: the SDK libraries are built with it (see
+# simw_lib.cmake), so they use the generated fsl_sss_ftr.h. Without it here the
+# test would fall back to fsl_sss_ftr_default.h, which disables SCP03, giving
+# ex_sss_boot_ctx_t a different struct layout than the libraries and a NULL
+# SCP03 keystore at command time. (Plain mode happens to match either way.)
 RUN gcc -o /app/test_se050 /app/test_se050.c \
+    -DSSS_USE_FTR_FILE \
     -I/app \
     -I/app/simw-top \
     -I/app/simw-top/sss/inc \
@@ -86,6 +98,12 @@ RUN gcc -o /app/test_se050 /app/test_se050.c \
     2>&1
 
 # ---- Run test ----
+# Platform SCP03 static keys for the SCP03 variant. Deliberately NON-default
+# so the run exercises the key-override path on both sides (the simulator via
+# SE050_SIM_SCP03_ENC/_MAC, the SDK via EX_SSS_BOOT_SCP03_PATH). Inert when
+# Auth=None. Trap: /tmp/SE05X/plain_scp.txt would beat EX_SSS_BOOT_SCP03_PATH,
+# so the image must never create that path.
+COPY sdk-test/scp03_keys.txt /app/scp03_keys.txt
 COPY sdk-test/run_test.sh /app/run_test.sh
 RUN chmod +x /app/run_test.sh
 

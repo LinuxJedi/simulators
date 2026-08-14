@@ -306,9 +306,64 @@ The upstream [imrank03/nxp-se050](https://github.com/imrank03/nxp-se050) Rust dr
 | `SimpleTlv` header capacity (3) too small for extended TLV | Increase to 4 |
 | Response buffers too small (16 bytes) for hash/RSA | Increase to 260 bytes |
 
+## Platform SCP03
+
+Platform SCP03 (GlobalPlatform Secure Channel Protocol 03: INITIALIZE
+UPDATE / EXTERNAL AUTHENTICATE, then C-MAC + C-ENC + R-MAC + R-ENC wrapping
+of every APDU) is supported. The full NXP Plug & Trust SDK test suite runs
+over the secure channel against the simulator in CI (`sdk-test-scp03` and
+`wolfcrypt-test-scp03` workflows).
+
+- Static keys default to NXP's compiled-in platform SCP keys per applet
+  personality (SE050E OEF 0001A921 set for the 7.2 parts, SE050_DEVKIT set
+  for 3.1.1), overridable via `SE050_SIM_SCP03_ENC` / `_MAC` / `_DEK` /
+  `_KVN` (hex). The SDK reads matching keys from a file via
+  `EX_SSS_BOOT_SCP03_PATH`.
+- Build the SCP03 variant of a Docker tier with
+  `--build-arg SE05X_AUTH=PlatfSCP03` (default `None` keeps plain mode).
+- `SetPlatformSCPRequest` is modelled: setting SCP_REQUIRED inside a session
+  makes plain commands fail 0x6985 (persisted).
+
+Not modelled: SCP02, ECKey / AppletSCP03 authenticated sessions, and PUT KEY
+(key rotation).
+
+### Implementation notes (worth knowing before you change this code)
+
+The command counter and the response-encryption ICV are **applet-generation
+dependent**, and the host middleware picks the rule from the applet version:
+`fsl_sss_se05x_apis.c` tags the session `kSSS_AuthType_AESKey` when
+`appletVersion` is at least `0x04030000` and `kSSS_AuthType_SCP03` below it.
+
+| | applet 4.3 and newer (7.2.0, SE050E) | older applets (3.1.1) |
+| --- | --- | --- |
+| Counter advance | after every command | only if the command carried a body (error responses: only if that body was not exactly 8 bytes) |
+| Response ICV | current counter | `counter - 1` for a body-less command |
+
+Both are modelled per personality (`Session::legacy` in `src/scp03/mod.rs`,
+with unit tests pinning each rule). Two failure modes to keep in mind:
+
+- A wrong **counter** rule fails loudly and immediately: the next command
+  cannot be decrypted, so the padding check trips.
+- A wrong **ICV** rule is **silent**. The R-MAC still verifies and the status
+  word is still 0x9000, but the host decrypts garbage and logs
+  `RAPDU Decoding failed No Padding found`. This surfaces much later as an
+  unrelated-looking failure -- it originally cost a P-224 `ecc_test_vector`
+  in the wolfCrypt tier, because the SDK could not read the EC curve list and
+  the following keypair import failed with `WC_HW_E`.
+
+Responses are protected only when the security level includes R-MAC *and* the
+status word is 0x9000, which is exactly when the host unwraps one. A success
+response with no data still carries an R-MAC (a bare MAC+SW response).
+
+Because of the silent failure mode, a host-side test written from the same
+reading of the spec as the simulator will happily agree with itself. The
+SCP03 Docker tiers running the real NXP middleware are what actually catch
+these; treat them as required coverage, not a nice-to-have.
+
 ## Known Issues
 
-- **SCP03**: Secure Channel Protocol 03 is not implemented. The simulator operates in plain (unauthenticated) mode only.
+- The `SE050_SIM_SCP03_ENC/_MAC` static keys default to well-known NXP
+  development keys; do not treat a simulated SCP03 channel as confidential.
 
 ## License
 
