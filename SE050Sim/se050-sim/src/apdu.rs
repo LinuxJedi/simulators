@@ -166,6 +166,7 @@ pub const SW_COMMAND_NOT_ALLOWED: u16 = 0x6986;
 pub const SW_WRONG_P1P2: u16 = 0x6A86;
 pub const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
 pub const SW_FILE_NOT_FOUND: u16 = 0x6A82;
+pub const SW_REF_DATA_NOT_FOUND: u16 = 0x6A88;
 
 // SE050 instruction constants (masked with 0x1F)
 pub const INS_WRITE: u8 = 0x01;

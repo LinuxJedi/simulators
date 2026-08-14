@@ -318,7 +318,13 @@ over the secure channel against the simulator in CI (`sdk-test-scp03` and
   personality (SE050E OEF 0001A921 set for the 7.2 parts, SE050_DEVKIT set
   for 3.1.1), overridable via `SE050_SIM_SCP03_ENC` / `_MAC` / `_DEK` /
   `_KVN` (hex). The SDK reads matching keys from a file via
-  `EX_SSS_BOOT_SCP03_PATH`.
+  `EX_SSS_BOOT_SCP03_PATH`. Note these defaults match what the SDK compiles
+  in, which is not necessarily what a given physical part uses -- platform
+  SCP keys are per-OEF, so talking to real silicon generally means supplying
+  that part's keys through the environment.
+- A wrong key version is refused at INITIALIZE UPDATE with 0x6A88 on applet
+  3.1.1, while applet 7.2.0 accepts any version there and only fails later at
+  EXTERNAL AUTHENTICATE. Both are bench-verified and modelled.
 - Build the SCP03 variant of a Docker tier with
   `--build-arg SE05X_AUTH=PlatfSCP03` (default `None` keeps plain mode).
 - `SetPlatformSCPRequest` is modelled: setting SCP_REQUIRED inside a session

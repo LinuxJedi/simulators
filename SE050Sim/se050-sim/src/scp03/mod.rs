@@ -39,8 +39,8 @@ pub mod crypto;
 pub mod keys;
 
 use crate::apdu::{
-    ApduResponse, ParsedApdu, SW_CONDITIONS_NOT_SATISFIED, SW_NO_ERROR, SW_SECURITY_STATUS,
-    SW_WRONG_P1P2,
+    ApduResponse, ParsedApdu, SW_CONDITIONS_NOT_SATISFIED, SW_NO_ERROR, SW_REF_DATA_NOT_FOUND,
+    SW_SECURITY_STATUS, SW_WRONG_P1P2,
 };
 use crate::applet::AppletVersion;
 use keys::{Scp03Config, I_PARAM, KEY_DIVERSIFICATION_DATA};
@@ -155,11 +155,21 @@ impl Scp03State {
             return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
         };
 
-        // Bench-verified (SE050E): the response key-info KVN echoes the
-        // requested version, defaulting to the configured KVN for P1=0x00,
-        // and INITIALIZE UPDATE always returns 0x9000 regardless of KVN (a
-        // wrong KVN is only rejected later, at EXTERNAL AUTHENTICATE).
+        // Key version handling differs by applet generation (both bench-
+        // verified, with P1 = 0x00 / 0x0b / 0x0c):
+        //
+        // * 7.2.0 (SE050E): INITIALIZE UPDATE never validates the key version.
+        //   Even a bogus P1 returns 0x9000 and is echoed back in the key-info
+        //   bytes; the wrong key is only caught at EXTERNAL AUTHENTICATE, when
+        //   the cryptogram fails to verify.
+        // * 3.1.1 (SE050C): the applet checks the key version up front and
+        //   refuses an unknown one with 0x6A88, so the response always carries
+        //   the configured KVN.
         let resp_kvn = if p1 == 0x00 { cfg.kvn } else { p1 };
+        if legacy && p1 != 0x00 && p1 != cfg.kvn {
+            *self = Scp03State::Idle;
+            return ApduResponse::error(SW_REF_DATA_NOT_FOUND);
+        }
 
         // 29-byte body: key-div(10) || KVN || SCP id (0x03) || i-param ||
         // card challenge(8) || card cryptogram(8). i-param 0x00 => no
@@ -407,12 +417,35 @@ mod tests {
         assert!(st.is_pending());
     }
 
+    /// Key-version handling is applet-generation specific, both bench-verified.
+    /// 7.2.0 accepts any key version at INITIALIZE UPDATE and echoes it back;
+    /// 3.1.1 validates it up front and refuses an unknown one with 0x6A88.
     #[test]
-    fn initialize_update_echoes_requested_kvn() {
+    fn initialize_update_key_version_rules_per_applet_generation() {
+        let restore = std::env::var("SE050_SIM_APPLET").ok();
+
+        std::env::set_var("SE050_SIM_APPLET", "7.2.0");
         let mut st = Scp03State::new();
         let resp = st.initialize_update(0x0c, &[0u8; 8]);
-        assert_eq!(resp.sw, 0x9000);
-        assert_eq!(resp.data[10], 0x0c);
+        assert_eq!(resp.sw, 0x9000, "7.2.0 accepts any key version");
+        assert_eq!(resp.data[10], 0x0c, "and echoes it back");
+
+        std::env::set_var("SE050_SIM_APPLET", "3");
+        let mut st = Scp03State::new();
+        let resp = st.initialize_update(0x0c, &[0u8; 8]);
+        assert_eq!(resp.sw, SW_REF_DATA_NOT_FOUND, "3.1.1 refuses a bad KVN");
+        // The configured version and the "use the default" form still work.
+        for p1 in [0x00, keys::DEFAULT_KVN] {
+            let mut st = Scp03State::new();
+            let resp = st.initialize_update(p1, &[0u8; 8]);
+            assert_eq!(resp.sw, 0x9000, "p1={:#04x}", p1);
+            assert_eq!(resp.data[10], keys::DEFAULT_KVN);
+        }
+
+        match restore {
+            Some(v) => std::env::set_var("SE050_SIM_APPLET", v),
+            None => std::env::remove_var("SE050_SIM_APPLET"),
+        }
     }
 
     #[test]
