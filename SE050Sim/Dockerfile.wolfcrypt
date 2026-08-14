@@ -32,6 +32,12 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=sim-builder /app/se050-sim/target/release/tcp_server /app/se050-sim-server
 
+# Auth mode for the NXP SDK: "None" (plain, default) or "PlatfSCP03".
+# The SCP03 variant needs the struct-layout alignment applied at the SDK cmake
+# step below, otherwise session-key derivation corrupts the heap.
+ARG SE05X_AUTH=None
+ENV SE05X_AUTH=${SE05X_AUTH}
+
 # ---- Clone SDK at v04.07.01 and apply wolfSSL OSP patch ----
 WORKDIR /app
 RUN git clone --branch v04.07.01 --depth 1 \
@@ -43,6 +49,21 @@ RUN curl -fsSL \
     cd /app/simw-top && \
     patch -p1 -l --forward --fuzz=3 < /tmp/simw.patch && \
     test -f sss/src/wolfssl/fsl_sss_wolfssl_apis.c
+
+# For Platform SCP03, the OSP patch defines
+#   SSS_WOLFSSL_SCP03_ONLY := SSS_HAVE_SE05X_AUTH_PLATFSCP03
+# which, when on, #undef's HAVE_ECC/CURVE25519/ED25519/HKDF/AESGCM/AESCCM and
+# stubs the digest/asymmetric host-crypto functions to kStatus_SSS_Fail. That
+# would regress the wolfCrypt suite's RSA/PSS/OAEP coverage (which relies on
+# the host digest/EMSA path). Force it to 0 so the full wolfSSL host-crypto
+# backend is retained alongside the SCP03 channel. NOTE: this diverges from a
+# stock SCP03-only wolfSSL build, which keeps the stripped backend.
+RUN if [ "$SE05X_AUTH" = "PlatfSCP03" ]; then \
+      f=/app/simw-top/sss/src/wolfssl/fsl_sss_wolfssl_apis.c; \
+      sed -i 's/#define SSS_WOLFSSL_SCP03_ONLY SSS_HAVE_SE05X_AUTH_PLATFSCP03/#define SSS_WOLFSSL_SCP03_ONLY 0/' "$f"; \
+      echo "=== SSS_WOLFSSL_SCP03_ONLY after override ==="; \
+      grep -n "SSS_WOLFSSL_SCP03_ONLY" "$f" | head || echo "(macro absent in this patch -> already evaluates to 0)"; \
+    fi
 
 # Replace PAL I2C with TCP transport (simulator talks over TCP, not real I2C)
 COPY wolfcrypt-test/i2c_a7.c /app/simw-top/hostlib/hostLib/platform/linux/i2c_a7.c
@@ -80,12 +101,27 @@ RUN ./configure \
     ldconfig
 
 # ---- Build patched SDK with HostCrypto=WOLFSSL ----
-RUN mkdir -p /app/simw-top/build && cd /app/simw-top/build && \
+# For Platform SCP03 the SDK's wolfSSL HostCrypto backend
+# (fsl_sss_wolfssl_apis.c) must see the same struct layout as the runtime
+# wolfSSL (Pass-B, built --with-se050 --enable-cryptocb): struct Cmac/Aes gain
+# WOLFSSL_SE050 (useSWCrypt) and WOLF_CRYPTO_CB (devId/devCtx) fields, so
+# without these defines the SDK's SSS_MALLOC(sizeof(Cmac)) is undersized and
+# the SCP03 session-key derivation corrupts the heap. Defining WOLFSSL_SE050
+# makes aes.h pull in se050_port.h, which BUILD_SE050 does not install in
+# Pass-A, so copy it from the wolfSSL source first. Gated to SCP03 so the
+# plain build is unchanged.
+RUN if [ "$SE05X_AUTH" = "PlatfSCP03" ]; then \
+      mkdir -p /usr/local/include/wolfssl/wolfcrypt/port/nxp && \
+      cp /app/wolfssl/wolfssl/wolfcrypt/port/nxp/se050_port.h \
+         /usr/local/include/wolfssl/wolfcrypt/port/nxp/se050_port.h && \
+      EXTRA="-DWOLFSSL_SE050 -DWOLF_CRYPTO_CB"; \
+    else EXTRA=""; fi; \
+    mkdir -p /app/simw-top/build && cd /app/simw-top/build && \
     cmake .. \
       -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_C_FLAGS="-fPIC" \
+      -DCMAKE_C_FLAGS="-fPIC $EXTRA" \
       -DPTMW_Applet=SE05X_C \
-      -DPTMW_SE05X_Auth=None \
+      -DPTMW_SE05X_Auth=${SE05X_AUTH} \
       -DPTMW_SMCOM=T1oI2C \
       -DPTMW_HostCrypto=WOLFSSL \
       -DPTMW_Host=LinuxLike \
@@ -172,6 +208,8 @@ RUN gcc -o /app/wolfcrypt_se050_test /tmp/main.o /tmp/test.o \
     2>&1
 
 # ---- Run test ----
+# Platform SCP03 static keys for the SCP03 variant (inert when Auth=None).
+COPY sdk-test/scp03_keys.txt /app/scp03_keys.txt
 COPY wolfcrypt-test/run_test.sh /app/run_test.sh
 RUN chmod +x /app/run_test.sh
 

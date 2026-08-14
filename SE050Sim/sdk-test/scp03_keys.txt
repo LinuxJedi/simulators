@@ -1,0 +1,11 @@
+# Platform SCP03 static keys for the SCP03 CI variant.
+#
+# Deliberately NON-default (not the NXP compiled-in OEF keys) so that a run
+# genuinely exercises the key-override plumbing on both sides: the simulator
+# reads them from SE050_SIM_SCP03_ENC / _MAC, and the NXP SDK reads this file
+# via EX_SSS_BOOT_SCP03_PATH. If these equaled the defaults an override bug on
+# either side would be invisible.
+#
+# Format is the SDK's scp03_keys_from_path() format: "ENC <hex>" / "MAC <hex>".
+ENC 000102030405060708090A0B0C0D0E0F
+MAC 101112131415161718191A1B1C1D1E1F

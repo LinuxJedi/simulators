@@ -22,9 +22,10 @@
 /// T=1 protocol responder (ISO 7816-3 over I2C).
 /// This is the SE050-side of the T=1 protocol, mirroring the driver's T1overI2C.
 
-use crate::apdu::{ApduResponse, ParsedApdu};
+use crate::apdu::{ApduResponse, ParsedApdu, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS};
 use crate::dispatch;
 use crate::object_store::ObjectStore;
+use crate::scp03::Scp03State;
 
 /// CRC-16/X-25 calculation using the crc16 crate (matches the driver).
 pub fn crc16_x25(data: &[u8]) -> u16 {
@@ -160,6 +161,8 @@ pub struct T1Responder {
     iseq_rcv: u8,   // expected I-frame seq from host
     iseq_snd: u8,   // our I-frame send seq
     apdu_reassembly: Vec<u8>,
+    /// Per-connection SCP03 secure channel state.
+    scp03: Scp03State,
 }
 
 impl T1Responder {
@@ -171,6 +174,7 @@ impl T1Responder {
             iseq_rcv: 0,
             iseq_snd: 0,
             apdu_reassembly: Vec::new(),
+            scp03: Scp03State::new(),
         }
     }
 
@@ -208,10 +212,12 @@ impl T1Responder {
     fn handle_s_request(&mut self, code: u8) -> Vec<Vec<u8>> {
         match code {
             T1_S_INTERFACE_SOFT_RESET => {
-                // Reset sequence numbers and respond with ATR
+                // Reset sequence numbers and respond with ATR. A chip reset
+                // also tears down any SCP03 secure channel.
                 self.iseq_rcv = 0;
                 self.iseq_snd = 0;
                 self.apdu_reassembly.clear();
+                self.scp03.reset();
 
                 let ft = FrameType::SFrame {
                     code: T1_S_INTERFACE_SOFT_RESET,
@@ -225,6 +231,7 @@ impl T1Responder {
                 self.iseq_rcv = 0;
                 self.iseq_snd = 0;
                 self.apdu_reassembly.clear();
+                self.scp03.reset();
 
                 let ft = FrameType::SFrame { code: 0x00, is_response: true };
                 let (header, payload_crc) = build_frame(self.nad_se2hd, ft, &[]);
@@ -276,9 +283,76 @@ impl T1Responder {
         self.build_response_frames(&response_bytes)
     }
 
-    fn process_apdu(&self, apdu_bytes: &[u8], store: &mut ObjectStore) -> ApduResponse {
+    fn process_apdu(&mut self, apdu_bytes: &[u8], store: &mut ObjectStore) -> ApduResponse {
+        // SCP03 interception happens on the raw bytes, before ParsedApdu masks
+        // the INS with 0x1F (INITIALIZE UPDATE's 0x50 and EXTERNAL
+        // AUTHENTICATE's 0x82 would otherwise alias existing SE050 commands).
+        if apdu_bytes.len() >= 4 {
+            let (cla, ins) = (apdu_bytes[0], apdu_bytes[1]);
+
+            // SELECT terminates any secure channel, then proceeds plain.
+            if cla == 0x00 && ins == 0xA4 {
+                self.scp03.reset();
+            }
+
+            // INITIALIZE UPDATE (CLA 0x80 INS 0x50): valid from any state.
+            if cla == 0x80 && ins == 0x50 {
+                return match ParsedApdu::parse(apdu_bytes) {
+                    Ok(a) => self.scp03.initialize_update(a.p1, &a.data),
+                    Err(_) => ApduResponse::error(0x6700),
+                };
+            }
+
+            // EXTERNAL AUTHENTICATE (CLA 0x84 INS 0x82) completes a handshake
+            // started by INITIALIZE UPDATE. Outside an established session that
+            // is the only thing 84 82 can mean, so route it even when no
+            // handshake is pending: the state machine then answers 0x6985
+            // ("conditions of use not satisfied") instead of it falling through
+            // to the wrapped-command path and being reported as a MAC failure.
+            // Inside an active session it stays a wrapped command, whose
+            // decrypted inner INS may legitimately be 0x82.
+            if cla == 0x84 && ins == 0x82 && !self.scp03.is_active() {
+                return self.scp03.external_authenticate(apdu_bytes);
+            }
+
+            // Secure-messaging CLA bit: unwrap, dispatch, wrap. With no active
+            // channel this is a protocol error.
+            if cla & 0x04 != 0 {
+                let unwrapped = match &mut self.scp03 {
+                    Scp03State::Active(sess) => sess.unwrap_command(apdu_bytes),
+                    _ => return ApduResponse::error(SW_SECURITY_STATUS),
+                };
+                let inner = match unwrapped {
+                    Ok(a) => a,
+                    Err(sw) => {
+                        self.scp03.reset();
+                        return ApduResponse::error(sw);
+                    }
+                };
+                let resp = dispatch::dispatch(&inner, store, true);
+                return match &mut self.scp03 {
+                    Scp03State::Active(sess) => sess.wrap_response(resp),
+                    _ => ApduResponse::error(SW_SECURITY_STATUS),
+                };
+            }
+
+            // A plain proprietary command while a secure channel is active:
+            // real silicon refuses it; terminate the channel.
+            if cla == 0x80 && self.scp03.is_active() {
+                self.scp03.reset();
+                return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+            }
+
+            // SetPlatformSCPRequest enforcement: with SCP required, plain
+            // commands are refused. SELECT and the GP handshake commands are
+            // exempt by the checks above, so a host can always open a channel.
+            if cla == 0x80 && store.scp_required() {
+                return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+            }
+        }
+
         match ParsedApdu::parse(apdu_bytes) {
-            Ok(apdu) => dispatch::dispatch(&apdu, store),
+            Ok(apdu) => dispatch::dispatch(&apdu, store, false),
             Err(e) => {
                 log::warn!("Failed to parse APDU: {:?}", e);
                 ApduResponse::error(0x6700) // Wrong length

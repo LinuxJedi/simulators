@@ -1,0 +1,32 @@
+name: SDK test (SCP03)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  sdk-test-scp03:
+    name: NXP Plug&Trust SDK over Platform SCP03
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build sdk-test image (Platform SCP03)
+        uses: docker/build-push-action@v6
+        with:
+          context: SE050Sim
+          file: SE050Sim/Dockerfile.sdk-test
+          build-args: |
+            SE05X_AUTH=PlatfSCP03
+          tags: se050-sdk-test-scp03:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run sdk-test suite over SCP03
+        run: docker run --rm se050-sdk-test-scp03:ci

@@ -27,7 +27,10 @@ use crate::applet::AppletVersion;
 use crate::handlers;
 use crate::object_store::ObjectStore;
 
-pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
+/// Route a plain (already-unwrapped) APDU. `scp_active` is true when this
+/// command arrived over an established SCP03 channel; it gates commands whose
+/// hardware behavior depends on being in an authenticated session.
+pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore, scp_active: bool) -> ApduResponse {
     // Applet personality (SE050_SIM_APPLET env var; defaults to the
     // SE051 / applet 7.2.0 the simulator has always advertised).
     let version = AppletVersion::from_env();
@@ -38,7 +41,10 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
         return handlers::session::handle_select(apdu, store, version);
     }
 
-    // All other SE050 proprietary commands use CLA=0x80 or 0x84
+    // All other SE050 proprietary commands use CLA=0x80. A wire CLA of 0x84
+    // means SCP03 secure messaging and is unwrapped by the T=1 layer
+    // (see t1.rs) before reaching here, so 0x84 is still accepted as an alias
+    // for robustness (e.g. direct handler unit tests).
     if apdu.cla != 0x80 && apdu.cla != 0x84 {
         return ApduResponse::error(SW_INS_NOT_SUPPORTED);
     }
@@ -185,6 +191,10 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
                 // General management
                 (_, P2_VERSION) | (_, P2_MEMORY) | (_, P2_RANDOM) | (_, P2_DELETE_ALL) => {
                     handlers::management::handle(apdu, store, version)
+                }
+                // SetPlatformSCPRequest: only meaningful in an SCP03 session.
+                (_, P2_SCP) => {
+                    handlers::management::handle_set_platform_scp(apdu, store, scp_active)
                 }
                 (_, P2_EXIST) | (_, P2_DELETE_OBJECT) => {
                     handlers::object_mgmt::handle_mgmt(apdu, store)

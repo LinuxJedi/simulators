@@ -166,6 +166,7 @@ pub const SW_COMMAND_NOT_ALLOWED: u16 = 0x6986;
 pub const SW_WRONG_P1P2: u16 = 0x6A86;
 pub const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
 pub const SW_FILE_NOT_FOUND: u16 = 0x6A82;
+pub const SW_REF_DATA_NOT_FOUND: u16 = 0x6A88;
 
 // SE050 instruction constants (masked with 0x1F)
 pub const INS_WRITE: u8 = 0x01;
@@ -228,6 +229,7 @@ pub const P2_VALIDATE_ONESHOT: u8 = 0x46;
 pub const P2_CRYPTO_LIST: u8 = 0x47;
 pub const P2_RAW: u8 = 0x4F;
 pub const P2_RANDOM: u8 = 0x49;
+pub const P2_SCP: u8 = 0x52; // SetPlatformSCPRequest
 
 // Secure object types (for ReadType responses)
 pub const OBJ_TYPE_EC_KEY_PAIR: u8 = 0x01;

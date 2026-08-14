@@ -71,6 +71,9 @@ pub struct ObjectStore {
     pub crypto_objects: HashMap<u16, CryptoObjectState>,
     /// Registry of created crypto object types (ID -> (context_type, subtype)).
     pub crypto_object_types: HashMap<u16, (u8, u8)>,
+    /// SetPlatformSCPRequest state: when true, plain (non-SCP03) commands are
+    /// refused. Persisted, matching the boot-persistent flag on real silicon.
+    scp_required: bool,
 }
 
 fn default_curves() -> HashMap<u8, u8> {
@@ -86,6 +89,7 @@ impl ObjectStore {
             ec_curves: default_curves(),
             crypto_objects: HashMap::new(),
             crypto_object_types: HashMap::new(),
+            scp_required: false,
         }
     }
 
@@ -96,6 +100,7 @@ impl ObjectStore {
             ec_curves: default_curves(),
             crypto_objects: HashMap::new(),
             crypto_object_types: HashMap::new(),
+            scp_required: false,
         };
         store.load();
         store
@@ -190,6 +195,17 @@ impl ObjectStore {
         removed
     }
 
+    // ---- Platform SCP03 required flag ----
+
+    pub fn scp_required(&self) -> bool {
+        self.scp_required
+    }
+
+    pub fn set_scp_required(&mut self, required: bool) {
+        self.scp_required = required;
+        self.persist();
+    }
+
     fn persist(&self) {
         let Some(path) = &self.persist_path else { return };
         let objects: HashMap<ObjectIdKey, &SecureObject> = self
@@ -205,6 +221,7 @@ impl ObjectStore {
         let doc = serde_json::json!({
             "objects": objects,
             "ec_curves": curves,
+            "scp_required": self.scp_required,
         });
         if let Ok(json) = serde_json::to_string_pretty(&doc) {
             let _ = std::fs::write(path, json);
@@ -221,6 +238,11 @@ impl ObjectStore {
         // Current schema: {"objects": {...}, "ec_curves": {...}}.
         // Legacy schema (pre curve-state): a flat hex-id -> object map.
         let objects_value = if value.get("objects").is_some() {
+            // Additive since a later schema version; absent in older files.
+            self.scp_required = value
+                .get("scp_required")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if let Some(curves) = value.get("ec_curves").and_then(|v| v.as_object()) {
                 self.ec_curves = curves
                     .iter()
