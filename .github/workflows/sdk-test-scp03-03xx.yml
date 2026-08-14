@@ -1,0 +1,39 @@
+name: SDK test (SCP03, applet 3.1.1)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  sdk-test-scp03-03xx:
+    name: NXP Plug&Trust SDK over Platform SCP03 (applet 3.1.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Platform SCP03 against the pre-4.3 applet personality. The middleware
+      # tags a session with an applet older than 4.3 kSSS_AuthType_SCP03
+      # instead of kSSS_AuthType_AESKey, which changes both the command-counter
+      # advance rule and the response-encryption ICV. This job is the only
+      # coverage of that path: forcing the 7.2 rules here drops the suite from
+      # 31/31 to 6/31.
+      - name: Build sdk-test image (SCP03, 03_XX)
+        uses: docker/build-push-action@v6
+        with:
+          context: SE050Sim
+          file: SE050Sim/Dockerfile.sdk-test
+          build-args: |
+            SE05X_AUTH=PlatfSCP03
+            SE05X_VER=03_XX
+          tags: se050-sdk-test-scp03-03xx:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run sdk-test suite over SCP03 (applet 3.1.1)
+        run: docker run --rm se050-sdk-test-scp03-03xx:ci

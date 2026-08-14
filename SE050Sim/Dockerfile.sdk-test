@@ -17,6 +17,14 @@ FROM debian:bookworm
 ARG SE05X_AUTH=None
 ENV SE05X_AUTH=${SE05X_AUTH}
 
+# Applet generation the SDK is compiled for: "07_02" (default) or "03_XX".
+# run_test.sh points the simulator at the matching personality; the middleware
+# aborts session open if the two disagree ("Compiled for 0x70200. Got older
+# 0x30101"). The 03_XX variant is what covers the pre-4.3 Platform SCP
+# counter / response-ICV rules.
+ARG SE05X_VER=07_02
+ENV SE05X_VER=${SE05X_VER}
+
 RUN apt-get update && apt-get install -y \
     build-essential cmake git python3 pkg-config \
     libssl-dev \
@@ -48,7 +56,7 @@ RUN mkdir -p /app/simw-top/build && cd /app/simw-top/build && \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_C_FLAGS="-fPIC" \
       -DPTMW_Applet=SE05X_C \
-      -DPTMW_SE05X_Ver=07_02 \
+      -DPTMW_SE05X_Ver=${SE05X_VER} \
       -DPTMW_SE05X_Auth=${SE05X_AUTH} \
       -DPTMW_SMCOM=T1oI2C \
       -DPTMW_HostCrypto=OPENSSL \

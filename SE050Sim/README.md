@@ -340,7 +340,13 @@ dependent**, and the host middleware picks the rule from the applet version:
 | Response ICV | current counter | `counter - 1` for a body-less command |
 
 Both are modelled per personality (`Session::legacy` in `src/scp03/mod.rs`,
-with unit tests pinning each rule). Two failure modes to keep in mind:
+with unit tests pinning each rule) and both are exercised end-to-end against
+the real middleware in CI: `sdk-test-scp03` builds the SDK for `07_02`, and
+`sdk-test-scp03-03xx` builds it for `03_XX` and points the simulator at the
+3.1.1 personality. The older path is not incidental coverage -- forcing the
+7.2 rules onto the 3.1.1 job drops it from 31/31 to 6/31.
+
+Two failure modes to keep in mind:
 
 - A wrong **counter** rule fails loudly and immediately: the next command
   cannot be decrypted, so the padding check trips.

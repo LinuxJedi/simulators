@@ -7,6 +7,13 @@ export SE050_SIM_HOST=127.0.0.1
 export SE050_SIM_PORT=8050
 export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
+# The simulator personality must match the applet generation the SDK was
+# compiled for, or session open aborts on the version check.
+if [ "$SE05X_VER" = "03_XX" ]; then
+    export SE050_SIM_APPLET=3
+    echo "=== Applet personality: 3.1.1 (SDK built for 03_XX) ==="
+fi
+
 # Platform SCP03 variant: provision the simulator and the SDK from the same
 # key file so the two sides cannot drift.
 if [ "$SE05X_AUTH" = "PlatfSCP03" ]; then
