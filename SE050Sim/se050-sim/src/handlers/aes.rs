@@ -48,14 +48,14 @@ pub const CIPHER_MODE_ECB_NOPAD: u8 = 0x0E; // kSE05x_CipherMode_AES_ECB_NOPAD
 pub const CIPHER_MODE_CTR: u8 = 0xF0; // kSE05x_CipherMode_AES_CTR
 
 /// AES block cipher over any of the three key sizes.
-enum AnyAes {
+pub(crate) enum AnyAes {
     A128(aes::Aes128),
     A192(aes::Aes192),
     A256(aes::Aes256),
 }
 
 impl AnyAes {
-    fn new(key: &[u8]) -> Option<Self> {
+    pub(crate) fn new(key: &[u8]) -> Option<Self> {
         match key.len() {
             16 => aes::Aes128::new_from_slice(key).ok().map(AnyAes::A128),
             24 => aes::Aes192::new_from_slice(key).ok().map(AnyAes::A192),
@@ -64,7 +64,7 @@ impl AnyAes {
         }
     }
 
-    fn encrypt_block(&self, block: &mut [u8; 16]) {
+    pub(crate) fn encrypt_block(&self, block: &mut [u8; 16]) {
         let ga = GenericArray::from_mut_slice(block);
         match self {
             AnyAes::A128(c) => c.encrypt_block(ga),
@@ -100,7 +100,7 @@ fn ecb_process(cipher: &AnyAes, data: &[u8], encrypting: bool) -> Vec<u8> {
 }
 
 /// Process block-aligned data in CBC mode, advancing the chain vector.
-fn cbc_process(cipher: &AnyAes, chain: &mut [u8; 16], data: &[u8], encrypting: bool) -> Vec<u8> {
+pub(crate) fn cbc_process(cipher: &AnyAes, chain: &mut [u8; 16], data: &[u8], encrypting: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     for chunk in data.chunks(16) {
         let mut block = [0u8; 16];
@@ -718,7 +718,7 @@ mod hmac_write_tests {
             le: None,
         };
         let mut store = ObjectStore::new();
-        let resp = dispatch(&apdu, &mut store);
+        let resp = dispatch(&apdu, &mut store, false);
         assert_eq!(resp.sw, 0x9000);
         match store.get(&[0x00, 0x00, 0x00, 0x66]) {
             Some(SecureObject::HMACKey { key: stored, policy }) => {
@@ -752,7 +752,7 @@ mod hmac_write_tests {
             le: None,
         };
         let mut store = ObjectStore::new();
-        let resp = dispatch(&apdu, &mut store);
+        let resp = dispatch(&apdu, &mut store, false);
         assert_eq!(resp.sw, 0x9000);
         match store.get(&[0x00, 0x00, 0x00, 0x67]) {
             Some(SecureObject::HMACKey { key: stored, policy }) => {
@@ -783,7 +783,7 @@ mod hmac_write_tests {
             le: None,
         };
         let mut store = ObjectStore::new();
-        let resp = dispatch(&apdu, &mut store);
+        let resp = dispatch(&apdu, &mut store, false);
         assert_eq!(resp.sw, SW_WRONG_DATA);
         assert!(store.get(&[0x00, 0x00, 0x00, 0x68]).is_none());
     }
@@ -800,7 +800,7 @@ mod hmac_write_tests {
             le: None,
         };
         let mut store = ObjectStore::new();
-        let resp = dispatch(&apdu, &mut store);
+        let resp = dispatch(&apdu, &mut store, false);
         assert_eq!(resp.sw, SW_WRONG_DATA);
     }
 }

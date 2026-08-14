@@ -63,7 +63,7 @@ where
     mac.finalize().into_bytes().to_vec()
 }
 
-fn cmac_aes(key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn cmac_aes(key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
     // A macro sidesteps the deep trait bounds Cmac<C> would need in a
     // generic helper; the three AES key sizes are concrete here.
     macro_rules! do_cmac {

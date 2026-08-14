@@ -1196,12 +1196,12 @@ mod tests {
             data: body,
             le: None,
         };
-        assert_eq!(dispatch(&keygen, &mut store).sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(dispatch(&keygen, &mut store, false).sw, SW_CONDITIONS_NOT_SATISFIED);
 
         for param in [0x01, 0x02, 0x04, 0x08, 0x10] {
             store.curve_add_param(0x05, param);
         }
-        assert_eq!(dispatch(&keygen, &mut store).sw, 0x9000);
+        assert_eq!(dispatch(&keygen, &mut store, false).sw, 0x9000);
         match store.get(&key_id) {
             Some(SecureObject::ECKeyPair { curve: ECCurve::NistP521, public_key, .. }) => {
                 assert_eq!(public_key.len(), 133, "uncompressed P-521 point");

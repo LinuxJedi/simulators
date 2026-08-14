@@ -20,7 +20,7 @@
  */
 
 use crate::apdu::{ApduResponse, ParsedApdu, P2_VERSION, P2_MEMORY, P2_RANDOM, P2_DELETE_ALL,
-                  SW_CONDITIONS_NOT_SATISFIED};
+                  SW_CONDITIONS_NOT_SATISFIED, SW_WRONG_DATA};
 use crate::applet::AppletVersion;
 use crate::object_store::ObjectStore;
 use crate::tlv::{self, Tlv, TAG_1};
@@ -94,6 +94,39 @@ fn handle_get_random(apdu: &ParsedApdu, version: AppletVersion) -> ApduResponse 
 fn handle_delete_all(_apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
     store.clear();
     ApduResponse::success()
+}
+
+/// SetPlatformSCPRequest (INS_MGMT, P2=0x52): sets whether plain
+/// (non-SCP03) commands are accepted. On real silicon this requires a
+/// session authenticated with the reserved platform-SCP identity, so the
+/// simulator requires an active SCP03 channel (`scp_active`) and otherwise
+/// returns 0x6985. The nxp-se050 Rust driver sends this command plain with
+/// an empty body, so it fails here exactly as it would on hardware.
+///
+/// Body: TLV Tag1, 1 byte -- 0x01 = SCP required, 0x02 = not required.
+pub fn handle_set_platform_scp(
+    apdu: &ParsedApdu,
+    store: &mut ObjectStore,
+    scp_active: bool,
+) -> ApduResponse {
+    if !scp_active {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    let tlvs = match apdu.parse_tlvs() {
+        Ok(t) => t,
+        Err(_) => return ApduResponse::error(SW_WRONG_DATA),
+    };
+    match tlv::find_tlv(&tlvs, TAG_1).and_then(|t| t.value.first().copied()) {
+        Some(0x01) => {
+            store.set_scp_required(true);
+            ApduResponse::success()
+        }
+        Some(0x02) => {
+            store.set_scp_required(false);
+            ApduResponse::success()
+        }
+        _ => ApduResponse::error(SW_WRONG_DATA),
+    }
 }
 
 #[cfg(test)]

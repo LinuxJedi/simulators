@@ -228,6 +228,7 @@ pub const P2_VALIDATE_ONESHOT: u8 = 0x46;
 pub const P2_CRYPTO_LIST: u8 = 0x47;
 pub const P2_RAW: u8 = 0x4F;
 pub const P2_RANDOM: u8 = 0x49;
+pub const P2_SCP: u8 = 0x52; // SetPlatformSCPRequest
 
 // Secure object types (for ReadType responses)
 pub const OBJ_TYPE_EC_KEY_PAIR: u8 = 0x01;
