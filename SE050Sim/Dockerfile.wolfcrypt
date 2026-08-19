@@ -163,6 +163,7 @@ RUN make clean 2>&1 && \
       --enable-sha224 \
       --enable-sha384 \
       --enable-sha512 \
+      --enable-pkcs7 \
       --disable-examples \
       --enable-crypttests \
       CFLAGS="-DWOLFSSL_SE050_INIT -DWOLFSSL_SE050_NO_TRNG -DSIZEOF_LONG_LONG=8 \
