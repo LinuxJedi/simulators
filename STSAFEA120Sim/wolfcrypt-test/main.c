@@ -28,7 +28,8 @@
  *
  *   1. RNG via stse_generate_random
  *   2. ECC P-256 keygen on the device, sign+verify locally
- *   3. ECDH against an off-device peer
+ *   3. ECDSA verify with a digest shorter than the field size
+ *      (P-256 + 28-byte SHA-224, F-11238 regression)
  *
  * This is narrower than wolfSSL's full wolfcrypt_test() because the
  * simulator only implements the STSAFE-A120 surface wolfSSL exercises,
