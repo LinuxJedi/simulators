@@ -28,7 +28,8 @@
  *
  *   1. RNG via stse_generate_random
  *   2. ECC P-256 keygen on the device, sign+verify locally
- *   3. ECDH against an off-device peer
+ *   3. ECDSA verify with a digest shorter than the field size
+ *      (P-256 + 28-byte SHA-224, F-11238 regression)
  *
  * This is narrower than wolfSSL's full wolfcrypt_test() because the
  * simulator only implements the STSAFE-A120 surface wolfSSL exercises,
@@ -158,6 +159,91 @@ static int ecc_p256_round_trip(int devId) {
     return 0;
 }
 
+/*
+ * F-11238 regression: ECDSA verify with a prehash shorter than the field
+ * size (P-256 + 28-byte SHA-224 digest, a valid NIST pairing).
+ *
+ * The A120 requires a field-size prehash on the wire (the simulator models
+ * real silicon and rejects other lengths), so the port must normalize the
+ * digest host-side: left-pad a short digest, left-truncate a long one.
+ * Pre-fix builds copied key_sz bytes from the caller's digest buffer,
+ * reading past its end for short digests and submitting a wrong digest,
+ * so this valid signature failed to verify.
+ *
+ * Vectors: P-256 public key (raw X/Y, the same shape the port imports after
+ * an on-device keygen), digest = SHA-224 of a fixed message, signature over
+ * that digest (openssl dgst -sha224 -sign). The matching private key was
+ * throwaway and is not shipped; only the public key is needed to route
+ * verify through the STSAFE crypto-cb.
+ */
+static const unsigned char k_f11238_pub_x[32] = {
+    0x8f, 0xa6, 0x96, 0x7a, 0x49, 0x38, 0x96, 0x1c, 0x9e, 0xdb, 0xd5, 0x10,
+    0x8e, 0x99, 0xd8, 0x3b, 0x21, 0xb1, 0xc0, 0x2e, 0x13, 0xc3, 0xed, 0xd7,
+    0x03, 0xbc, 0xd8, 0x07, 0x61, 0xe6, 0xa3, 0x87
+};
+
+static const unsigned char k_f11238_pub_y[32] = {
+    0x68, 0xb7, 0x7d, 0xfe, 0xd6, 0xe1, 0x2f, 0xa9, 0x46, 0xa6, 0x21, 0x07,
+    0xa5, 0x13, 0x4c, 0x59, 0x92, 0x5c, 0x99, 0x58, 0x3d, 0xcc, 0x64, 0xdd,
+    0xd1, 0xea, 0xc2, 0x0e, 0x9b, 0x28, 0xc6, 0xcf
+};
+
+static const unsigned char k_f11238_digest28[] = {
+    0x01, 0x86, 0xc9, 0xdb, 0x3c, 0xf0, 0x37, 0xbb, 0xf7, 0x14, 0x0f, 0xec,
+    0x39, 0xd6, 0x53, 0xf8, 0x38, 0x1d, 0x8f, 0x5a, 0x01, 0x4c, 0x95, 0x37,
+    0xea, 0xef, 0x77, 0x66
+};
+
+static const unsigned char k_f11238_sig_der[] = {
+    0x30, 0x46, 0x02, 0x21, 0x00, 0xeb, 0xd0, 0x14, 0x33, 0x71, 0x39, 0x0e,
+    0x34, 0x35, 0x7b, 0xf1, 0x30, 0x95, 0x00, 0xbe, 0x3a, 0xfa, 0x01, 0x9f,
+    0xd1, 0xd7, 0xa4, 0xf2, 0x03, 0x68, 0xae, 0x67, 0xa7, 0x9f, 0x29, 0xd2,
+    0xd5, 0x02, 0x21, 0x00, 0xb8, 0x88, 0x2d, 0xb2, 0xe6, 0x03, 0x70, 0x7e,
+    0x52, 0x2a, 0xcf, 0xaa, 0x13, 0x05, 0x03, 0x0a, 0x1c, 0x59, 0xd2, 0x7b,
+    0x14, 0x3c, 0x5c, 0x27, 0x13, 0xff, 0x34, 0xf1, 0x62, 0xe5, 0x35, 0x5c
+};
+
+static int ecc_p256_short_digest_verify(int devId) {
+    fprintf(stdout, "\n=== ecc_p256_short_digest_verify ===\n");
+    ecc_key key;
+    int verified = 0;
+    int ret;
+    unsigned char bad_digest[sizeof(k_f11238_digest28)];
+
+    ret = wc_ecc_init_ex(&key, NULL, devId);
+    EXPECT_OK("wc_ecc_init_ex (short digest)", ret);
+    if (ret != 0) return -1;
+
+    ret = wc_ecc_import_unsigned(&key, k_f11238_pub_x, k_f11238_pub_y,
+                                 NULL, ECC_SECP256R1);
+    EXPECT_OK("wc_ecc_import_unsigned (P-256 public key)", ret);
+    if (ret != 0) {
+        wc_ecc_free(&key);
+        return -1;
+    }
+
+    /* Route subsequent ops on this key through the STSAFE device. */
+    key.devId = devId;
+
+    ret = wc_ecc_verify_hash(k_f11238_sig_der, sizeof(k_f11238_sig_der),
+                             k_f11238_digest28, sizeof(k_f11238_digest28),
+                             &verified, &key);
+    EXPECT_OK("wc_ecc_verify_hash (28-byte digest, valid sig)", ret);
+    EXPECT_TRUE("short-digest signature verifies", verified == 1);
+
+    /* Negative control: a corrupted digest must not verify. */
+    memcpy(bad_digest, k_f11238_digest28, sizeof(bad_digest));
+    bad_digest[0] ^= 0x01;
+    verified = 0;
+    ret = wc_ecc_verify_hash(k_f11238_sig_der, sizeof(k_f11238_sig_der),
+                             bad_digest, sizeof(bad_digest), &verified, &key);
+    EXPECT_OK("wc_ecc_verify_hash (corrupted digest)", ret);
+    EXPECT_TRUE("corrupted digest rejected", verified == 0);
+
+    wc_ecc_free(&key);
+    return 0;
+}
+
 int main(void) {
     fprintf(stdout, "wolfCrypt + STSAFE-A120 simulator smoke test\n");
     if (init_stse() != 0) {
@@ -181,6 +267,7 @@ int main(void) {
 
     rng_smoke_test();
     ecc_p256_round_trip(devId);
+    ecc_p256_short_digest_verify(devId);
 
     wolfCrypt_Cleanup();
     fprintf(stdout, "\n=== Summary ===\nRan %d assertions, %d failed\n", g_run, g_failures);
