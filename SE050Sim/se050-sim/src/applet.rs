@@ -84,7 +84,7 @@ impl AppletVersion {
     }
 
     /// Parse a personality token. Accepts "f", "52f", "se052f" -- any
-    /// value ending in "f" -- plus "7.2.22", for the SE052F; "e",
+    /// value ending in "f" -- plus exactly "7.2.22", for the SE052F; "e",
     /// "se050e", "7.2.0e" -- any value ending in "e" -- for the SE050E;
     /// "3", "3.1.1" for the SE050C; and anything else ("7", "7.2",
     /// "7.2.0", unrecognized) for the SE051.
@@ -93,7 +93,7 @@ impl AppletVersion {
     /// "3f" selects the SE052F and "3e" the SE050E.
     pub fn from_token(token: &str) -> Self {
         let t = token.trim().to_ascii_lowercase();
-        if t.ends_with('f') || t.starts_with("7.2.22") {
+        if t.ends_with('f') || t == "7.2.22" {
             AppletVersion::V7_2_22F
         } else if t.ends_with('e') {
             AppletVersion::V7_2_0E
@@ -261,6 +261,10 @@ mod tests {
             ("SE052F", AppletVersion::V7_2_22F),
             ("7.2.22", AppletVersion::V7_2_22F),
             (" se052f ", AppletVersion::V7_2_22F),
+            // The version token matches exactly: a longer string that
+            // merely starts with it must not select the SE052F.
+            ("7.2.220", AppletVersion::V7_2_0),
+            ("7.2.22e", AppletVersion::V7_2_0E),
             // The suffix rules take precedence over the leading-3 rule,
             // matching the documented behavior.
             ("3e", AppletVersion::V7_2_0E),

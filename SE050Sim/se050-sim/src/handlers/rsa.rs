@@ -76,11 +76,38 @@ pub fn handle_write_rsa_key(
         });
     }
 
-    // The SE052F has RSA but refuses a public-key import (modulus +
-    // exponent) with 0x6A80, while generating a key pair on the same
-    // part works. Bench-verified.
-    if apdu.key_type() == P1_PUBLIC_KEY && !version.supports_rsa_public_import() {
-        return ApduResponse::error(SW_WRONG_DATA);
+    // The SE052F has RSA but refuses a public-key import with 0x6A80,
+    // while generating a key pair on the same part works. Bench-verified
+    // with the key part set to Public and modulus + exponent in one
+    // APDU.
+    //
+    // Two APDU shapes mean "import a public key", and both are refused
+    // so the restriction cannot be sidestepped: the applet's own
+    // discriminator (the P1 key-part bits), and an APDU that simply
+    // carries a complete public key -- modulus and exponent -- with no
+    // private component. The second form was not exercised on silicon;
+    // it is refused because it is the same operation reached through a
+    // different encoding.
+    //
+    // The private-key import path is deliberately left alone. The
+    // wolfCrypt port imports (E, D, N) across three separate APDUs, so
+    // no single APDU there carries modulus and exponent together
+    // without private material, and none of them sets the public key
+    // part. Refusing on the mere presence of a public component would
+    // break that flow at its first APDU.
+    if !version.supports_rsa_public_import() {
+        let has_private_component = [
+            TAG_RSA_P, TAG_RSA_Q, TAG_RSA_DP, TAG_RSA_DQ, TAG_RSA_QINV,
+            TAG_RSA_PRIV,
+        ]
+        .iter()
+        .any(|tag| tlv::find_tlv(&tlvs, *tag).is_some());
+        let carries_whole_public_key = tlv::find_tlv(&tlvs, TAG_RSA_PUB_MOD).is_some()
+            && tlv::find_tlv(&tlvs, TAG_RSA_PUB_EXP).is_some()
+            && !has_private_component;
+        if apdu.key_type() == P1_PUBLIC_KEY || carries_whole_public_key {
+            return ApduResponse::error(SW_WRONG_DATA);
+        }
     }
 
     let obj_id = match tlv::find_tlv(&tlvs, TAG_1) {
@@ -672,5 +699,74 @@ mod tests {
             &write_rsa_apdu(keygen_2k), &mut store, AppletVersion::V7_2_22F);
         assert_eq!(resp.sw, 0x9000, "SE052F generates 2048-bit RSA keys");
         assert!(store.exists(&obj_2k));
+    }
+
+    #[test]
+    fn se052f_public_import_refused_without_key_part_bits() {
+        // The key-part bits are the applet's own discriminator, but an
+        // APDU carrying a whole public key means the same thing even
+        // with those bits clear. Refusing only on the bits would let a
+        // caller sidestep the SE052F restriction.
+        use crate::applet::AppletVersion;
+        let mut store = ObjectStore::new();
+        let obj_id = [0x7Fu8, 0x40, 0x00, 0x04];
+
+        let mut import = Vec::new();
+        import.extend_from_slice(&Tlv::new(TAG_1, &obj_id).encode());
+        import.extend_from_slice(&Tlv::new(TAG_2, &2048u16.to_be_bytes()).encode());
+        import.extend_from_slice(
+            &Tlv::new(TAG_RSA_PUB_EXP, &[0x01, 0x00, 0x01]).encode());
+        import.extend_from_slice(&Tlv::new(TAG_RSA_PUB_MOD, &[0xB1; 256]).encode());
+
+        // write_rsa_apdu leaves P1 as bare P1_RSA: no key-part bits.
+        let resp = handle_write_rsa_key(
+            &write_rsa_apdu(import.clone()), &mut store, AppletVersion::V7_2_22F);
+        assert_eq!(resp.sw, SW_WRONG_DATA);
+        assert!(!store.exists(&obj_id), "no public key object may be created");
+
+        // Unaffected on a personality that allows public import.
+        let resp = handle_write_rsa_key(
+            &write_rsa_apdu(import), &mut store, AppletVersion::V7_2_0);
+        assert_eq!(resp.sw, 0x9000);
+        assert!(store.exists(&obj_id));
+    }
+
+    #[test]
+    fn se052f_staged_private_import_still_works() {
+        // The wolfCrypt port imports a private key as (E, D, N) across
+        // three separate APDUs. None of them carries modulus and
+        // exponent together without private material, so the SE052F
+        // public-import refusal must not touch this flow -- refusing on
+        // the mere presence of a public component would break it at the
+        // very first APDU.
+        use crate::applet::AppletVersion;
+        let mut store = ObjectStore::new();
+        let obj_id = [0x7Fu8, 0x40, 0x00, 0x05];
+
+        let step = |tag: u8, value: &[u8]| {
+            let mut data = Vec::new();
+            data.extend_from_slice(&Tlv::new(TAG_1, &obj_id).encode());
+            data.extend_from_slice(&Tlv::new(TAG_2, &2048u16.to_be_bytes()).encode());
+            data.extend_from_slice(&Tlv::new(tag, value).encode());
+            crate::apdu::ParsedApdu {
+                cla: 0x80,
+                ins: crate::apdu::INS_WRITE,
+                p1: crate::apdu::P1_RSA | crate::apdu::P1_KEY_PAIR,
+                p2: crate::apdu::P2_DEFAULT,
+                data,
+                le: None,
+            }
+        };
+
+        for (name, tag, value) in [
+            ("exponent", TAG_RSA_PUB_EXP, vec![0x01, 0x00, 0x01]),
+            ("private exponent", TAG_RSA_PRIV, vec![0xC3; 256]),
+            ("modulus", TAG_RSA_PUB_MOD, vec![0xB1; 256]),
+        ] {
+            let resp = handle_write_rsa_key(
+                &step(tag, &value), &mut store, AppletVersion::V7_2_22F);
+            assert_eq!(resp.sw, 0x9000, "SE052F staged import step: {}", name);
+        }
+        assert!(store.exists(&obj_id));
     }
 }
