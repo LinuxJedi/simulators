@@ -155,6 +155,9 @@ mod tests {
             (AppletVersion::V3_1_1, 880u16),
             (AppletVersion::V7_2_0, 1018u16),
             (AppletVersion::V7_2_0E, 1018u16),
+            // SE052F, measured over Platform SCP03 (the only channel a
+            // real SE052F serves).
+            (AppletVersion::V7_2_22F, 1003u16),
         ] {
             let resp = handle(&random_apdu(0), &mut store, version);
             assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
@@ -186,15 +189,20 @@ mod tests {
         let resp = handle(&apdu, &mut store, AppletVersion::V7_2_0E);
         let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
         assert_eq!(tlvs[0].value, [0x07, 0x02, 0x00, 0x3F, 0x9F, 0xFF, 0xFF]);
+        let resp = handle(&apdu, &mut store, AppletVersion::V7_2_22F);
+        let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
+        assert_eq!(tlvs[0].value, [0x07, 0x02, 0x16, 0x26, 0xF2, 0xFF, 0xFF]);
     }
 
     #[test]
     fn test_get_free_memory_values_per_applet() {
-        // All bench parts reply with a 2-byte value; per-type values
-        // as measured on the bench (SE050E clamps PERSISTENT at
-        // 0x7FFF). The v04.07.01 middleware rejects TLV values longer
-        // than 2 bytes for these applets (tlvGet_U16), so a 4-byte
-        // reply would make Se05x_API_GetFreeMemory fail host-side.
+        // Per-type values as measured on the bench (the SE050E clamps
+        // PERSISTENT at 0x7FFF). The reply width is applet-dependent and
+        // load-bearing: the v04.07.01 middleware parses these applets
+        // with tlvGet_U16, which rejects any TLV value longer than 2
+        // bytes, so a 4-byte reply here would make
+        // Se05x_API_GetFreeMemory fail host-side. The SE052F is the
+        // opposite case and is covered separately below.
         let mut store = ObjectStore::new();
         for (version, persistent) in [
             (AppletVersion::V3_1_1, 31304u16),
@@ -213,6 +221,28 @@ mod tests {
                 persistent,
                 "{:?}", version
             );
+        }
+    }
+
+    #[test]
+    fn test_get_free_memory_is_u32_on_se052f() {
+        // Applet 7.2.22 has patch byte 0x16, so SE05X_CHECK_52F_VERSION
+        // routes the host to tlvGet_U32, which only accepts a 4-byte
+        // value. Bench-confirmed on SE052F silicon: 86336/1157/1152,
+        // and PERSISTENT is above 0xFFFF so it could not be reported
+        // over two bytes at all.
+        let mut store = ObjectStore::new();
+        for (mem_type, expected) in [(0x01u8, 86336u32), (0x02, 1157), (0x03, 1152)] {
+            let apdu = ParsedApdu {
+                cla: 0x80, ins: INS_MGMT, p1: P1_DEFAULT, p2: P2_MEMORY,
+                data: vec![TAG_1, 0x01, mem_type], le: None,
+            };
+            let resp = handle(&apdu, &mut store, AppletVersion::V7_2_22F);
+            assert_eq!(resp.sw, 0x9000);
+            let tlvs = crate::tlv::parse_tlvs(&resp.data).unwrap();
+            let v = &tlvs[0].value;
+            assert_eq!(v.len(), 4, "memory type {:#04x}", mem_type);
+            assert_eq!(u32::from_be_bytes([v[0], v[1], v[2], v[3]]), expected);
         }
     }
 }

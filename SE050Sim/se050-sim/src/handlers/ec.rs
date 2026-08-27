@@ -48,7 +48,11 @@ fn pad_hash(data: &[u8], scalar_len: usize) -> Vec<u8> {
 }
 
 /// Handle WRITE EC key command (key generation when P2=Default and no private key data).
-pub fn handle_write_ec_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
+pub fn handle_write_ec_key(
+    apdu: &ParsedApdu,
+    store: &mut ObjectStore,
+    version: crate::applet::AppletVersion,
+) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
         Err(_) => return ApduResponse::error(SW_WRONG_DATA),
@@ -72,6 +76,17 @@ pub fn handle_write_ec_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRe
         },
         _ => return ApduResponse::error(SW_WRONG_DATA),
     };
+
+    // The SE052F's appletConfig clears both the EDDSA and DH_MONT
+    // feature bits, and the part refuses key generation on either 25519
+    // curve with 0x6985 (bench-verified). Imports are refused here too,
+    // which follows from the feature being absent rather than from a
+    // separate measurement.
+    if matches!(curve, ECCurve::Ed25519 | ECCurve::Curve25519)
+        && !version.supports_25519()
+    {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
 
     // Weierstrass curves must exist as fully parameterized curve
     // objects before any key can be created on them; key generation on
@@ -1268,5 +1283,56 @@ mod test_ed25519_vector {
         
         assert_eq!(sig.to_bytes().to_vec(), expected_sig,
             "Ed25519 signature mismatch for empty message");
+    }
+}
+
+#[cfg(test)]
+mod test_se052f_curves {
+    use super::*;
+    use crate::applet::AppletVersion;
+
+    fn keygen_apdu(obj_id: [u8; 4], curve_byte: u8) -> ParsedApdu {
+        let mut data = Vec::new();
+        data.extend_from_slice(&Tlv::new(TAG_1, &obj_id).encode());
+        data.extend_from_slice(&Tlv::new(TAG_2, &[curve_byte]).encode());
+        ParsedApdu {
+            cla: 0x80,
+            ins: crate::apdu::INS_WRITE,
+            p1: crate::apdu::P1_EC | P1_KEY_PAIR,
+            p2: crate::apdu::P2_DEFAULT,
+            data,
+            le: None,
+        }
+    }
+
+    #[test]
+    fn se052f_refuses_25519_curves() {
+        // Bench-verified on real SE052F silicon: its appletConfig
+        // (0x26f2) clears EDDSA and DH_MONT, and key generation on
+        // either 25519 curve is refused 0x6985. NIST curves still work,
+        // and the other personalities keep serving 25519.
+        let mut store = ObjectStore::new();
+        let obj_id = [0x7Fu8, 0x50, 0x00, 0x01];
+
+        for (name, curve_byte) in [("Ed25519", 0x40u8), ("X25519", 0x41)] {
+            let resp = handle_write_ec_key(
+                &keygen_apdu(obj_id, curve_byte), &mut store,
+                AppletVersion::V7_2_22F);
+            assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED, "{}", name);
+            assert!(!store.exists(&obj_id), "{} must not be created", name);
+
+            let resp = handle_write_ec_key(
+                &keygen_apdu(obj_id, curve_byte), &mut store,
+                AppletVersion::V7_2_0);
+            assert_eq!(resp.sw, 0x9000, "{} on the SE051 personality", name);
+            assert!(store.exists(&obj_id));
+            store.remove(&obj_id);
+        }
+
+        // P-256 (curve id 0x03) is unaffected on the SE052F.
+        let resp = handle_write_ec_key(
+            &keygen_apdu(obj_id, 0x03), &mut store, AppletVersion::V7_2_22F);
+        assert_eq!(resp.sw, 0x9000, "SE052F still generates NIST keys");
+        assert!(store.exists(&obj_id));
     }
 }
