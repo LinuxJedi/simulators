@@ -76,6 +76,13 @@ pub fn handle_write_rsa_key(
         });
     }
 
+    // The SE052F has RSA but refuses a public-key import (modulus +
+    // exponent) with 0x6A80, while generating a key pair on the same
+    // part works. Bench-verified.
+    if apdu.key_type() == P1_PUBLIC_KEY && !version.supports_rsa_public_import() {
+        return ApduResponse::error(SW_WRONG_DATA);
+    }
+
     let obj_id = match tlv::find_tlv(&tlvs, TAG_1) {
         Some(t) if t.value.len() == 4 => {
             let mut id = [0u8; 4];
@@ -114,6 +121,11 @@ pub fn handle_write_rsa_key(
         let key_size_usize = key_size_bits as usize;
         if ![1024, 2048, 3072, 4096].contains(&key_size_usize) {
             return ApduResponse::error(SW_WRONG_DATA);
+        }
+        // The SE052F refuses anything below 2048 bits with 0x6985
+        // (bench-verified: 1024-bit CRT generation fails, 2048 works).
+        if key_size_bits < version.rsa_min_key_bits() {
+            return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
         }
         let Ok(private_key) = RsaPrivateKey::new(&mut OsRng, key_size_usize) else {
             return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
@@ -601,5 +613,64 @@ mod tests {
             &write_rsa_apdu(keygen_1k), &mut store, AppletVersion::V7_2_0);
         assert_eq!(resp.sw, 0x9000, "SE051 personality keeps RSA keygen");
         assert!(store.exists(&obj_id));
+    }
+
+    fn write_rsa_pub_apdu(data: Vec<u8>) -> crate::apdu::ParsedApdu {
+        crate::apdu::ParsedApdu {
+            cla: 0x80,
+            ins: crate::apdu::INS_WRITE,
+            p1: crate::apdu::P1_RSA | crate::apdu::P1_PUBLIC_KEY,
+            p2: crate::apdu::P2_DEFAULT,
+            data,
+            le: None,
+        }
+    }
+
+    #[test]
+    fn se052f_rsa_restrictions() {
+        // Bench-verified on real SE052F silicon: RSA is present (unlike
+        // the SE050E) but 1024-bit generation refuses 0x6985, 2048-bit
+        // generation works, and a public-key import refuses 0x6A80.
+        use crate::applet::AppletVersion;
+        let mut store = ObjectStore::new();
+        let obj_id = [0x7Fu8, 0x40, 0x00, 0x02];
+
+        let mut keygen_1k = Vec::new();
+        keygen_1k.extend_from_slice(&Tlv::new(TAG_1, &obj_id).encode());
+        keygen_1k.extend_from_slice(&Tlv::new(TAG_2, &1024u16.to_be_bytes()).encode());
+        let resp = handle_write_rsa_key(
+            &write_rsa_apdu(keygen_1k), &mut store, AppletVersion::V7_2_22F);
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED,
+                   "SE052F refuses RSA below 2048 bits");
+        assert!(!store.exists(&obj_id));
+
+        let mut pub_import = Vec::new();
+        pub_import.extend_from_slice(&Tlv::new(TAG_1, &obj_id).encode());
+        pub_import.extend_from_slice(&Tlv::new(TAG_2, &2048u16.to_be_bytes()).encode());
+        pub_import.extend_from_slice(
+            &Tlv::new(TAG_RSA_PUB_EXP, &[0x01, 0x00, 0x01]).encode());
+        pub_import.extend_from_slice(&Tlv::new(TAG_RSA_PUB_MOD, &[0xB1; 256]).encode());
+        let resp = handle_write_rsa_key(
+            &write_rsa_pub_apdu(pub_import.clone()), &mut store,
+            AppletVersion::V7_2_22F);
+        assert_eq!(resp.sw, SW_WRONG_DATA,
+                   "SE052F refuses RSA public key import");
+        assert!(!store.exists(&obj_id));
+
+        // The same import is served by the SE051 personality.
+        let resp = handle_write_rsa_key(
+            &write_rsa_pub_apdu(pub_import), &mut store, AppletVersion::V7_2_0);
+        assert_eq!(resp.sw, 0x9000);
+        assert!(store.exists(&obj_id));
+
+        // 2048-bit generation works on the SE052F.
+        let obj_2k = [0x7Fu8, 0x40, 0x00, 0x03];
+        let mut keygen_2k = Vec::new();
+        keygen_2k.extend_from_slice(&Tlv::new(TAG_1, &obj_2k).encode());
+        keygen_2k.extend_from_slice(&Tlv::new(TAG_2, &2048u16.to_be_bytes()).encode());
+        let resp = handle_write_rsa_key(
+            &write_rsa_apdu(keygen_2k), &mut store, AppletVersion::V7_2_22F);
+        assert_eq!(resp.sw, 0x9000, "SE052F generates 2048-bit RSA keys");
+        assert!(store.exists(&obj_2k));
     }
 }

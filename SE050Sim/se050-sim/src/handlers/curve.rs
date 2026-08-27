@@ -70,9 +70,12 @@ pub fn handle_create(
     }
     if store.curve_exists(curve_id) {
         return match version {
-            // Bench-verified on the SE051 and SE050E: re-creating an
-            // existing curve is refused and the curve is left intact.
-            AppletVersion::V7_2_0 | AppletVersion::V7_2_0E => {
+            // Bench-verified on the SE051, SE050E and SE052F:
+            // re-creating an existing curve is refused and the curve is
+            // left intact.
+            AppletVersion::V7_2_0
+            | AppletVersion::V7_2_0E
+            | AppletVersion::V7_2_22F => {
                 ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED)
             }
             // Bench-verified on the SE050C: the duplicate create is
