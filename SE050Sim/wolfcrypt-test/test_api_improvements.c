@@ -6,6 +6,7 @@
 #define USE_CERT_BUFFERS_2048
 #define USE_CERT_BUFFERS_4096
 #include <wolfssl/certs_test.h>
+#include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/ecc.h>
 #include <wolfssl/wolfcrypt/error-crypt.h>
 #include <wolfssl/wolfcrypt/hash.h>
@@ -344,6 +345,17 @@ int main(void)
         return fail("wc_se050_lock", ret);
     }
     wc_se050_unlock();
+#ifndef WOLFSSL_SE050_NO_ATTEST
+    {
+        wc_se050_attst_result attestation;
+
+        ret = wc_se050_attest_object(TEST_OBJECT_ID, TEST_ECC_ID,
+            WC_HASH_TYPE_SHA256, NULL, 0, &attestation);
+        if (ret != BAD_FUNC_ARG) {
+            return fail("attestation accepted no freshness challenge", ret);
+        }
+    }
+#endif
 
     ret = wc_se050_scp03_rotate_keys(&explicitKeys, 0x0B);
     if (ret != 0) {
@@ -377,6 +389,36 @@ int main(void)
     if (ret != 0) {
         return fail("wc_se050_init_ex(rederived)", ret);
     }
+#ifdef WOLFSSL_SE050_CRYPT
+    {
+        static const byte aesKey1[16] = {
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+        };
+        static const byte aesKey2[16] = {
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F
+        };
+        Aes aes;
+        int aesInit = 0;
+
+        ret = wc_AesInit(&aes, NULL, INVALID_DEVID);
+        if (ret == 0) {
+            aesInit = 1;
+            ret = wc_AesSetKey(&aes, aesKey1, sizeof(aesKey1), NULL,
+                AES_ENCRYPTION);
+        }
+        if (ret == 0) {
+            ret = wc_AesSetKey(&aes, aesKey2, sizeof(aesKey2), NULL,
+                AES_ENCRYPTION);
+        }
+        if (aesInit)
+            wc_AesFree(&aes);
+        if (ret != 0) {
+            return fail("repeated SE05x AES key setup", ret);
+        }
+    }
+#endif
 
     ret = wc_se050_insert_binary_object_ex(TEST_OBJECT_ID, value,
         (word32)sizeof(value) - 1U, WC_SE050_POLICY_ALLOW_READ, 0);
@@ -563,6 +605,15 @@ int main(void)
     }
     if (wc_se050_get_session() != NULL) {
         return fail("wolfCrypt_Cleanup did not close SE05x", -1);
+    }
+    readbackSz = sizeof(readback);
+    ret = wc_se050_get_binary_object(TEST_OBJECT_ID, readback, &readbackSz);
+    if (ret != BAD_STATE_E) {
+        return fail("uninitialized object read was not rejected", ret);
+    }
+    ret = wc_se050_erase_object(TEST_OBJECT_ID);
+    if (ret != BAD_STATE_E) {
+        return fail("uninitialized object erase was not rejected", ret);
     }
     puts("PASS: runtime SCP03, power-cycle derivation, initialization, "
          "rotation, session, policy insertion and policy key generation");
